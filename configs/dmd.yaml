@@ -1,0 +1,25 @@
+# Decoupled DMD, 4-step student. LoRA student and fake adapters on one frozen base (the teacher).
+trainer: trainers.dmd.DecoupledDMDT2ITrainer
+pretrained_model_name_or_path: briaai/Fibo-2.0-dev
+json_data_input_path: data_input.json
+checkpoint_local_path: checkpoints/dmd
+output_dir: output/dmd
+wandb_name: dmd
+seed: 42
+mixed_precision: bf16
+debug: 0
+max_train_steps: 1000
+gradient_accumulation_steps: 1
+learning_rate: 0.00001
+lr_scheduler: constant_with_warmup
+lr_warmup_steps: 100
+max_grad_norm: 1.0
+use_torch_compile: 1
+regional_compile: 1
+checkpointing_steps: 100
+lora_rank: 64
+denoising_loss_scale: 0.0
+
+dmd_num_inference_steps: "4"
+dmd_real_guidance_scale: 4.0
+dfake_gen_update_ratio: 5

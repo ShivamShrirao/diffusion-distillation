@@ -28,8 +28,7 @@ def get_cosine_schedule_with_warmup_and_decay(
             return 1.0
         return max(
             eps,
-            float(num_training_steps - current_step)
-            / float(max(1, num_training_steps - num_warmup_steps - constant_steps)),
+            float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps - constant_steps)),
         )
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)

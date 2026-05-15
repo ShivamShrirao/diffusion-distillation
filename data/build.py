@@ -126,7 +126,7 @@ def dummy_dataset_fn(build_sample, logger):
     return get_dataset
 
 
-def dataloader_fn(get_dataset, preprocess, collate_fn, args, seed, pin_memory=False):
+def dataloader_fn(get_dataset, preprocess, collate_fn, args, seed, pin_memory=True):
     rng = random.Random(seed)
 
     def get_dataloader():

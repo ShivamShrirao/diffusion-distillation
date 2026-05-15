@@ -39,6 +39,7 @@ import diffusers
 from diffusers.pipelines.bria_fibo2.pipeline_bria_fibo2 import DEFAULT_NEGATIVE_PROMPT
 import torch
 import wandb
+from diffusers.training_utils import cast_training_params
 from tqdm.auto import tqdm
 
 from args.base_args import add_base_args, read_config_defaults
@@ -46,6 +47,7 @@ from args.data_args import add_data_args
 from data.batch import T2IBatch
 from data.build import build_dataloader_t2i
 from distributed import build_accelerator, compile_transformer, set_nccl_env
+from lora.adapters import add_lora
 from train_utils.checkpoint import load_checkpoint
 from train_utils.lr_scheduler import build_lr_scheduler
 from train_utils.runtime import (
@@ -59,7 +61,7 @@ from train_utils.runtime import (
 from losses.denoising import compute_denoising_loss
 from models.text_encoder import build_text_encoder, create_attention_matrix
 from models.transformer import build_transformer
-from models.vae import build_vae, vae_scale_factor_from_config
+from models.vae import build_vae_config, vae_scale_factor_from_config
 from train_utils.packing import apply_cfg_dropout_t2i, pack_t2i, unpack_to_image
 
 
@@ -69,6 +71,34 @@ logger = get_logger(__name__)
 # TF32 matmul on Ampere+. Set at import time so it's effective before the first
 # transformer forward (Accelerator may construct things during prepare()).
 torch.set_float32_matmul_precision("high")
+
+# Per-device tensor-core peak TFLOPs at bf16/fp16, dense (no sparsity), from vendor specs.
+GPU_BF16_PEAK_TFLOPS = {
+    "H100": 989.0,
+    "H200": 989.0,
+    "A100": 312.0,
+    "A800": 312.0,
+    "B200": 2250.0,
+    "B100": 1800.0,
+    "L40S": 362.0,
+    "L40": 181.0,
+    "L4": 121.0,
+    "RTX 4090": 165.2,
+    "RTX 5090": 419.0,
+}
+
+
+def peak_flops_per_sec(dtype: torch.dtype) -> float | None:
+    """Return per-device peak FLOPs/sec for the current CUDA device, or None if unknown."""
+    if not torch.cuda.is_available():
+        return None
+    name = torch.cuda.get_device_name()
+    for key, tflops in GPU_BF16_PEAK_TFLOPS.items():
+        if key in name:
+            peak = tflops * 1e12
+            # fp32 (TF32) tensor cores deliver ~half the bf16/fp16 throughput on these GPUs.
+            return peak if dtype in (torch.bfloat16, torch.float16) else peak / 2
+    return None
 
 
 class BaseTrainer:
@@ -107,6 +137,10 @@ class BaseTrainer:
         self.vae_scale_factor: int | None = None
         self.ema_lora = None
         self.generator = None
+        self.transformer_param_count: int | None = None
+        self.transformer_inner_dim: int | None = None
+        self.flops_per_step: float | None = None
+        self.peak_flops_per_sec: float | None = None
         self.loss_coeff: float | None = None
         self.seed: int | None = None
         self.rank: int = 0
@@ -128,6 +162,26 @@ class BaseTrainer:
     def extra_setup(self):
         """Load reward / perceptual / ref-transformer models. Default: nothing."""
 
+    def configure_transformer(self):
+        """Apply LoRA / adapter setup and dtype-grad masking to ``self.transformer``.
+
+        Runs after ``build_transformer`` returns the bare model (init weights) and before ``accelerator.prepare``. The default handles the standard
+        single-LoRA and no-LoRA paths; DMD overrides
+        this to wire its student/fake dual-adapter setup. Must mutate ``self.transformer``
+        in place — may rewrap it as a ``PeftModel``.
+        """
+        args = self.args
+        if args.lora_rank > 0:
+            logger.info(f"Using LoRA with rank {args.lora_rank}")
+            self.transformer.requires_grad_(False)
+            self.transformer.to(dtype=self.weight_dtype)
+            self.transformer = add_lora(self.transformer, args.lora_rank)
+            cast_training_params([self.transformer], dtype=self.weight_dtype if args.use_fsdp else torch.float32)
+            self.transformer.print_trainable_parameters()
+        else:
+            self.transformer.requires_grad_(True)
+            assert self.transformer.dtype == torch.float32
+
     def post_optimizer_setup(self):
         """Runs after ``accelerator.prepare`` (so FSDP shards exist) and before
         ``torch.compile``. Use this to instantiate EMA-LoRA shadows or other
@@ -135,113 +189,6 @@ class BaseTrainer:
 
     def maybe_adjust_resume_step(self, global_step: int) -> int:
         return global_step + 1
-
-    def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
-        """Simple T2I flow-matching denoising step.
-
-        Subclasses override this entirely for other objectives.
-        """
-        height, width = self.args.resolution
-        device = self.accelerator.device
-
-        # ---- text encoder ----
-        eh, te_layers, prompt_attn_mask, text_encoder_time = self.run_text_encoder(batch.captions)
-        pixel_values = batch.pixel_values.to(device=device, dtype=torch.float32)
-        eh = eh.to(device=device, dtype=torch.float32)
-        prompt_attn_mask = prompt_attn_mask.to(device=device, dtype=torch.float32)
-
-        # ---- noisy latents ----
-        latents = (pixel_values - self.vae_config["shift_factor"]) * self.vae_config["scaling_factor"]
-        noise = torch.randn_like(latents)
-        bsz = pixel_values.shape[0]
-        sigmas = torch.rand(bsz, device=device)
-        timesteps = sigmas * 1000
-        while len(sigmas.shape) < len(noise.shape):
-            sigmas = sigmas.unsqueeze(-1)
-        noisy_latents = sigmas * noise + (1.0 - sigmas) * latents
-
-        num_text_tokens = eh.shape[1]
-
-        # ---- CFG dropout (single drop rate over prompt) ----
-        eh, te_layers, prompt_attn_mask = apply_cfg_dropout_t2i(
-            eh,
-            te_layers,
-            prompt_attn_mask,
-            self.null_conditioning,
-            self.null_conditioning_layers,
-            num_text_tokens,
-            self.args.drop_rate_cfg,
-            self.generator,
-        )
-
-        target = noise - latents
-
-        # ---- pack + attention mask ----
-        patched_noisy, patched_image_ids = pack_t2i(
-            noisy_latents,
-            height,
-            width,
-            self.vae_scale_factor,
-            self.args.do_patching,
-            device,
-        )
-        latent_attn = torch.ones(
-            [patched_noisy.shape[0], patched_noisy.shape[1]],
-            dtype=latents.dtype,
-            device=device,
-        )
-        attn_mask = torch.cat([prompt_attn_mask, latent_attn], dim=1)
-        mask_time = []
-        with CudaTimerContext(mask_time):
-            attn_mask = create_attention_matrix(attn_mask)
-        attn_mask = attn_mask.unsqueeze(dim=1)
-        joint_attn_kwargs = {"attention_mask": attn_mask}
-
-        # ---- forward + denoising loss ----
-        forward_time = []
-        with CudaTimerContext(forward_time):
-            model_pred, _ = self.transformer(
-                hidden_states=patched_noisy,
-                timestep=timesteps,
-                encoder_hidden_states=eh,
-                text_encoder_layers=te_layers,
-                img_ids=patched_image_ids,
-                return_dict=False,
-                joint_attention_kwargs=joint_attn_kwargs,
-            )
-            model_pred = unpack_to_image(model_pred, height, width, self.vae_scale_factor, self.args.do_patching)
-            denoising_loss = compute_denoising_loss(
-                model_pred,
-                target,
-                self.loss_coeff,
-                self.args.denoising_loss_scale,
-            )
-
-        return {
-            "loss": denoising_loss,
-            "named_losses": {"denoising": denoising_loss},
-            "timings": {
-                "text_encoder_time": text_encoder_time,
-                "forward_time": forward_time[0],
-                "create_mask_time": mask_time[0],
-                "fetch_batch": fetch_time_sec,
-            },
-        }
-
-    # ---------------------------------------------------------------
-    # Driver
-    # ---------------------------------------------------------------
-    def run(self):
-        # NCCL/EFA env vars must be set before the process group is initialised in
-        # `build_accelerator`. SSH helper has to start early so a stuck job is still
-        # reachable. Both happen here so entrypoints stay one-liners.
-        set_nccl_env()
-        self.print_cuda_info()
-        self.setup()
-        self.main_loop()
-        logger.info("Waiting for everyone :)")
-        self.accelerator.wait_for_everyone()
-        self.accelerator.end_training()
 
     # ---------------------------------------------------------------
     # Setup
@@ -259,19 +206,30 @@ class BaseTrainer:
         logger.info(f"TORCH_VERSION {torch.__version__}")
         logger.info(f"DIFFUSERS_VERSION {diffusers.__version__}")
 
-        self.vae, self.vae_config = build_vae(self.args, self.accelerator, self.weight_dtype)
+        self.vae_config = build_vae_config()
 
-        # Reward / perceptual / ref-transformer models go here. Lives BEFORE the main
+        # Reward / perceptual / ref-transformer models, and the VAE itself for trainers
+        # that decode pixels (DMD-with-image-logging). Lives BEFORE the main
         # transformer so a subclass can size its reward stack against the args first.
         self.extra_setup()
 
-        self.transformer, self.transformer_unwrapped, self.total_num_layers = build_transformer(
+        self.transformer, self.total_num_layers = build_transformer(
             self.args,
             self.vae_config,
             self.accelerator,
-            self.weight_dtype,
             logger,
         )
+        self.transformer_inner_dim = self.transformer.inner_dim
+        self.configure_transformer()
+        self.transformer_unwrapped = self.transformer
+        self.transformer_param_count = sum(p.numel() for p in self.transformer.parameters())
+        trainable_param_count = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
+        logger.info(f"Transformer Parameters: {self.transformer_param_count / 10**9}B")
+        logger.info(f"Trainable transformer Parameters: {trainable_param_count / 10**9}B")
+        if self.args.gradient_checkpointing:
+            self.transformer.enable_gradient_checkpointing()
+        if self.args.use_fsdp:
+            self.transformer = self.accelerator.prepare(self.transformer)
         logger.info(f"Using precision of {self.weight_dtype}")
 
         self.tokenizer, self.text_encoder, self.get_prompt_embedds = build_text_encoder(
@@ -289,6 +247,7 @@ class BaseTrainer:
             self.vae_config,
             logger,
         )
+        self.compute_mfu_constants()
         self.lr_scheduler = build_lr_scheduler(self.args, self.optimizer, self.accelerator.num_processes)
 
         if self.args.use_fsdp:
@@ -348,7 +307,104 @@ class BaseTrainer:
             betas=(self.args.adam_beta1, self.args.adam_beta2),
             weight_decay=self.args.adam_weight_decay,
             eps=self.args.adam_epsilon,
+            fused=True,
         )
+
+    def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
+        """Simple T2I flow-matching denoising step.
+
+        Subclasses override this entirely for other objectives.
+        """
+        height, width = self.args.resolution
+        device = self.accelerator.device
+
+        # ---- text encoder ----
+        eh, te_layers, prompt_attn_mask, text_encoder_time = self.run_text_encoder(batch.captions)
+        pixel_values = batch.pixel_values.to(device=device, dtype=torch.float32)
+        eh = eh.to(device=device, dtype=torch.float32)
+        prompt_attn_mask = prompt_attn_mask.to(device=device, dtype=torch.float32)
+
+        # ---- noisy latents ----
+        latents = (pixel_values - self.vae_config["shift_factor"]) * self.vae_config["scaling_factor"]
+        noise = torch.randn_like(latents)
+        bsz = pixel_values.shape[0]
+        sigmas = torch.rand(bsz, device=device)
+        timesteps = sigmas * 1000
+        while len(sigmas.shape) < len(noise.shape):
+            sigmas = sigmas.unsqueeze(-1)
+        noisy_latents = sigmas * noise + (1.0 - sigmas) * latents
+
+        num_text_tokens = eh.shape[1]
+
+        # ---- CFG dropout (single drop rate over prompt) ----
+        eh, te_layers, prompt_attn_mask = apply_cfg_dropout_t2i(
+            eh,
+            te_layers,
+            prompt_attn_mask,
+            self.null_conditioning,
+            self.null_conditioning_layers,
+            num_text_tokens,
+            self.args.drop_rate_cfg,
+            self.generator,
+        )
+
+        target = noise - latents
+
+        # ---- pack + attention mask ----
+        patched_noisy, patched_image_ids = pack_t2i(
+            noisy_latents,
+            height,
+            width,
+            self.vae_scale_factor,
+            self.args.do_patching,
+            device,
+        )
+        mask_time = [0.0]
+        if bsz > 1:
+            latent_attn = torch.ones(
+                [patched_noisy.shape[0], patched_noisy.shape[1]],
+                dtype=latents.dtype,
+                device=device,
+            )
+            attn_mask = torch.cat([prompt_attn_mask, latent_attn], dim=1)
+            mask_time = []
+            with CudaTimerContext(mask_time):
+                attn_mask = create_attention_matrix(attn_mask)
+            attn_mask = attn_mask.unsqueeze(dim=1)
+        else:
+            attn_mask = None
+        joint_attn_kwargs = {"attention_mask": attn_mask}
+
+        # ---- forward + denoising loss ----
+        forward_time = []
+        with CudaTimerContext(forward_time):
+            model_pred, _ = self.transformer(
+                hidden_states=patched_noisy,
+                timestep=timesteps,
+                encoder_hidden_states=eh,
+                text_encoder_layers=te_layers,
+                img_ids=patched_image_ids,
+                return_dict=False,
+                joint_attention_kwargs=joint_attn_kwargs,
+            )
+            model_pred = unpack_to_image(model_pred, height, width, self.vae_scale_factor, self.args.do_patching)
+            denoising_loss = compute_denoising_loss(
+                model_pred,
+                target,
+                self.loss_coeff,
+                self.args.denoising_loss_scale,
+            )
+
+        return {
+            "loss": denoising_loss,
+            "named_losses": {"denoising": denoising_loss},
+            "timings": {
+                "text_encoder_time": text_encoder_time,
+                "forward_time": forward_time[0],
+                "create_mask_time": mask_time[0],
+                "fetch_batch": fetch_time_sec,
+            },
+        }
 
     # ---------------------------------------------------------------
     # Main loop
@@ -423,6 +479,21 @@ class BaseTrainer:
                 break
 
     # ---------------------------------------------------------------
+    # Driver
+    # ---------------------------------------------------------------
+    def run(self):
+        # NCCL/EFA env vars must be set before the process group is initialised in
+        # `build_accelerator`. SSH helper has to start early so a stuck job is still
+        # reachable. Both happen here so entrypoints stay one-liners.
+        set_nccl_env()
+        self.print_cuda_info()
+        self.setup()
+        self.main_loop()
+        logger.info("Waiting for everyone :)")
+        self.accelerator.wait_for_everyone()
+        self.accelerator.end_training()
+
+    # ---------------------------------------------------------------
     # Logging
     # ---------------------------------------------------------------
     def accumulate_step_outputs(self, outputs: dict):
@@ -447,6 +518,11 @@ class BaseTrainer:
             **(outputs.get("timings") or {}),
             **{k: _item(v) for k, v in (outputs.get("log_extras") or {}).items()},
         }
+        if self.flops_per_step is not None and batch_time_sec > 0:
+            achieved = self.flops_per_step / batch_time_sec
+            log_params["tflops_per_sec"] = achieved / 1e12
+            if self.peak_flops_per_sec:
+                log_params["mfu"] = achieved / self.peak_flops_per_sec
         for k, v in self.named_loss_acc.items():
             log_params[f"train_{k}_loss"] = _item(v)
         wandb.log({**log_params, **(outputs.get("wandb_extras") or {})}, step=self.global_step)
@@ -455,6 +531,26 @@ class BaseTrainer:
     def reset_accumulators(self):
         self.train_loss = 0.0
         self.named_loss_acc = {}
+
+    def run_text_encoder(self, captions):
+        """Forward the text encoder, align layer count to the transformer, and return
+        ``(encoder_hidden_states, text_encoder_layers, prompt_attention_mask, encoder_time_sec)``.
+
+        Side-effect: trims ``self.null_conditioning_layers`` once on the first call so it
+        matches ``total_num_layers``. Subsequent calls are no-ops on it.
+        """
+        timer = []
+        with CudaTimerContext(timer):
+            eh, te_layers, prompt_attn_mask = self.get_prompt_embedds(captions)
+        te_layers = list(te_layers)
+        n = self.total_num_layers
+        if len(te_layers) >= n:
+            te_layers = te_layers[len(te_layers) - n :]
+            self.null_conditioning_layers = self.null_conditioning_layers[len(self.null_conditioning_layers) - n :]
+        else:
+            te_layers = te_layers + [te_layers[-1]] * (n - len(te_layers))
+            self.null_conditioning_layers = self.null_conditioning_layers + [self.null_conditioning_layers[-1]] * (n - len(self.null_conditioning_layers))
+        return eh, te_layers, prompt_attn_mask, timer[0]
 
     # ---------------------------------------------------------------
     # Checkpointing
@@ -493,28 +589,36 @@ class BaseTrainer:
                 pass
         logger.info(f"Saved state to {save_path}")
 
-    # ---------------------------------------------------------------
-    # Helpers exposed to subclasses
-    # ---------------------------------------------------------------
-    def run_text_encoder(self, captions):
-        """Forward the text encoder, align layer count to the transformer, and return
-        ``(encoder_hidden_states, text_encoder_layers, prompt_attention_mask, encoder_time_sec)``.
+    def compute_mfu_constants(self):
+        """Precompute per-step FLOPs and device peak for MFU logging.
 
-        Side-effect: trims ``self.null_conditioning_layers`` once on the first call so it
-        matches ``total_num_layers``. Subsequent calls are no-ops on it.
+        Closed-form Megatron approximation: 6*N*tokens for dense matmuls (fwd+bwd) plus
+        12*L*d_model*seq^2*B for joint attention. Multiplied by 4/3 under gradient
+        checkpointing to account for the re-forward in backward. Per-device — under FSDP
+        each rank still computes the full unsharded model on its local batch.
         """
-        timer = []
-        with CudaTimerContext(timer):
-            eh, te_layers, prompt_attn_mask = self.get_prompt_embedds(captions)
-        te_layers = list(te_layers)
-        n = self.total_num_layers
-        if len(te_layers) >= n:
-            te_layers = te_layers[len(te_layers) - n :]
-            self.null_conditioning_layers = self.null_conditioning_layers[len(self.null_conditioning_layers) - n :]
+        height, width = self.args.resolution
+        if self.args.do_patching:
+            image_seq = (height // (self.vae_scale_factor * 2)) * (width // (self.vae_scale_factor * 2))
         else:
-            te_layers = te_layers + [te_layers[-1]] * (n - len(te_layers))
-            self.null_conditioning_layers = self.null_conditioning_layers + [self.null_conditioning_layers[-1]] * (n - len(self.null_conditioning_layers))
-        return eh, te_layers, prompt_attn_mask, timer[0]
+            image_seq = (height // self.vae_scale_factor) * (width // self.vae_scale_factor)
+        seq_total = image_seq + self.args.max_sequence_length
+
+        tokens_per_step = self.args.train_batch_size * seq_total * self.args.gradient_accumulation_steps
+        dense = 6 * self.transformer_param_count * tokens_per_step
+        attn = 12 * self.total_num_layers * self.transformer_inner_dim * (seq_total**2) * self.args.train_batch_size * self.args.gradient_accumulation_steps
+        flops = dense + attn
+        if self.args.gradient_checkpointing:
+            flops *= 4.0 / 3.0
+
+        self.flops_per_step = float(flops)
+        self.peak_flops_per_sec = peak_flops_per_sec(self.weight_dtype)
+        logger.info(
+            f"MFU: {self.flops_per_step / 1e12:.2f} TFLOPs/step/device "
+            f"(seq={seq_total}, B={self.args.train_batch_size}, grad_acc={self.args.gradient_accumulation_steps}); "
+            f"peak={self.peak_flops_per_sec / 1e12 if self.peak_flops_per_sec else 'unknown'} TFLOPs/s "
+            f"on '{torch.cuda.get_device_name() if torch.cuda.is_available() else 'cpu'}'"
+        )
 
     @staticmethod
     def print_cuda_info():

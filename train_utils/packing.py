@@ -55,6 +55,7 @@ def prepare_latent_image_ids(batch_size, height, width, device, dtype):
 # Combined pack helpers used inline by the entrypoint loops.
 # ---------------------------------------------------------------------------
 
+
 def pack_t2i(
     noisy_latents: torch.Tensor,
     height: int,
@@ -72,9 +73,7 @@ def pack_t2i(
         ids = prepare_latent_image_ids(noisy_latents.shape[0], latent_h, latent_w, device, noisy_latents.dtype)
     else:
         packed = pack_latents(noisy_latents, noisy_latents.shape[0], num_channels_latents, latent_h, latent_w)
-        ids = prepare_latent_image_ids(
-            noisy_latents.shape[0], latent_h // 2, latent_w // 2, device, noisy_latents.dtype
-        )
+        ids = prepare_latent_image_ids(noisy_latents.shape[0], latent_h // 2, latent_w // 2, device, noisy_latents.dtype)
     return packed, ids
 
 
@@ -87,6 +86,7 @@ def unpack_to_image(packed: torch.Tensor, height: int, width: int, vae_scale_fac
 # ---------------------------------------------------------------------------
 # CFG dropout helpers
 # ---------------------------------------------------------------------------
+
 
 def apply_cfg_dropout_t2i(
     encoder_hidden_states: torch.Tensor,

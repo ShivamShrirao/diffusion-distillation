@@ -10,15 +10,9 @@ def add_decoupled_dmd_args(parser):
     )
     parser.add_argument(
         "--dmd_num_inference_steps",
-        type=str,
-        default="4",
-        help="Student generation steps as a single value ('4') or inclusive range ('1-4').",
-    )
-    parser.add_argument(
-        "--dmd_generation_guidance_scale",
-        type=float,
-        default=5.0,
-        help="CFG scale used while generating student samples for DMD.",
+        type=int,
+        default=4,
+        help="Number of student generation steps per training iteration.",
     )
     parser.add_argument(
         "--dmd_fake_loss_scale",
@@ -31,12 +25,6 @@ def add_decoupled_dmd_args(parser):
         type=float,
         default=5.0,
         help="Guidance scale used for CA real teacher update.",
-    )
-    parser.add_argument(
-        "--dmd_fake_guidance_scale",
-        type=float,
-        default=1.0,
-        help="CFG scale used for the fake/model score in the DM update.",
     )
     parser.add_argument(
         "--dmd_ca_weight",
@@ -61,4 +49,10 @@ def add_decoupled_dmd_args(parser):
         type=int,
         default=5,
         help="Run the generator update every Nth step; the fake/guidance score updates every step.",
+    )
+    parser.add_argument(
+        "--dmd_log_image_every",
+        type=int,
+        default=20,
+        help="Decode and log generated / teacher x0 / fake x0 / DM-update images every N global steps. 0 disables (also skips loading the VAE weights).",
     )

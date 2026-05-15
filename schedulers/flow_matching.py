@@ -4,6 +4,7 @@
 `build_infer_timesteps()` wraps the linspace-sigmas + calculate_shift +
 retrieve_timesteps combo used per-step inside the student rollout.
 """
+
 import numpy as np
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.flux.pipeline_flux import calculate_shift, retrieve_timesteps
@@ -43,23 +44,3 @@ def build_infer_timesteps(infer_scheduler, current_num_inference_steps: int, lat
         mu=mu,
     )
     return timesteps
-
-
-def parse_num_inference_steps_arg(num_inference_steps_arg):
-    """Accept either a single int ('16') or an inclusive range ('11-18'), as a string."""
-    val = str(num_inference_steps_arg).strip()
-    if "-" in val:
-        a, b = val.split("-", 1)
-        return int(a.strip()), int(b.strip())
-    n = int(val)
-    return n, n
-
-
-def pick_inference_steps(global_step: int, base_seed: int, min_steps: int, max_steps: int) -> int:
-    """Deterministic per-step pick from the inclusive `[min_steps, max_steps]` range.
-
-    Uses a hash of `global_step` and `base_seed` so all ranks/nodes pick the same value
-    without explicit distributed coordination.
-    """
-    span = max_steps - min_steps + 1
-    return min_steps + ((global_step * 9973 + base_seed) % span)

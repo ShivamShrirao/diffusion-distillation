@@ -33,19 +33,16 @@ def load_checkpoint(accelerator, args) -> int:
     """
     full_path = resolve_resume_checkpoint(args)
     if full_path is None:
-        accelerator.print(
-            f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
-        )
+        accelerator.print(f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run.")
         args.resume_from_checkpoint = None
         return 0
 
     accelerator.print(f"Resuming from checkpoint {full_path}")
     # DMD checkpoints save each adapter under its own subdir (student/, fake/); their
-    # weights are loaded in build_transformer before FSDP wrap, so skip the full-state load.
+    # weights are loaded by DMDTrainer.configure_transformer before FSDP wrap, so skip
+    # the full-state load here.
     if os.path.isdir(os.path.join(full_path, "student")):
-        accelerator.print(
-            "Detected multi-adapter LoRA checkpoint; adapter weights were loaded in build_transformer."
-        )
+        accelerator.print("Detected multi-adapter LoRA checkpoint; adapter weights were loaded by DMDTrainer.configure_transformer.")
     else:
         accelerator.load_state(full_path, map_location="cpu")
     global_step = int(os.path.basename(full_path).split("_")[-1])

@@ -3,6 +3,7 @@
 `set_nccl_env()` must be called BEFORE the process group is initialised —
 `BaseTrainer.run()` calls it first thing, so entrypoints don't need to do anything.
 """
+
 import functools
 import os
 from datetime import timedelta

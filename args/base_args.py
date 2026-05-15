@@ -38,9 +38,7 @@ def add_base_args(parser):
         help="Optional dir with transformer weights that replace the pretrained ones.",
     )
     parser.add_argument("--seed", type=int, default=10, help="Seed for reproducible training.")
-    parser.add_argument(
-        "--max_sequence_length", type=int, default=4096, help="Max sequence length for text encoder."
-    )
+    parser.add_argument("--max_sequence_length", type=int, default=4096, help="Max sequence length for text encoder.")
     parser.add_argument("--train_batch_size", type=int, default=2)
     parser.add_argument("--max_train_steps", type=int, default=10_000_000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
@@ -49,8 +47,7 @@ def add_base_args(parser):
         "--lr_scheduler",
         type=str,
         default="constant_with_warmup",
-        help="One of {linear, cosine, cosine_with_restarts, polynomial, constant, "
-        "constant_with_warmup, constant_with_warmup_cosine_decay}.",
+        help="One of {linear, cosine, cosine_with_restarts, polynomial, constant, constant_with_warmup, constant_with_warmup_cosine_decay}.",
     )
     parser.add_argument("--constant_steps", type=int, default=-1)
     parser.add_argument("--lr_warmup_steps", type=int, default=10_000)

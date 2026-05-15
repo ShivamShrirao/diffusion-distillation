@@ -3,6 +3,7 @@
 The value of ``--trainer`` is an importable ``module.path.ClassName`` (e.g.
 ``trainers.dmd.DecoupledDMDT2ITrainer``).
 """
+
 import argparse
 import importlib
 

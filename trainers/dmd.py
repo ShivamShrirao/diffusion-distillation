@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import os
-import random
 
 import torch
 import wandb
+from accelerate.utils import broadcast
 from diffusers.training_utils import cast_training_params
 from safetensors.torch import load_file
 
@@ -51,7 +51,6 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
     PARSER_MIXINS = [add_base_args, add_data_args, add_decoupled_dmd_args]
     BATCH_CLS = T2IBatch
     DATALOADER_BUILDER = staticmethod(build_dataloader_t2i)
-    WANDB_PROJECT = "dmd"
 
     def __init__(self):
         super().__init__()
@@ -68,14 +67,14 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         assert args.lora_rank > 0, "DMD trainer requires lora_rank > 0"
         logger.info(f"Using DMD LoRA adapters: student rank {args.lora_rank}, fake rank {args.lora_rank}")
         self.transformer.requires_grad_(False)
-        self.transformer.to(dtype=self.weight_dtype)
+        self.transformer.to(dtype=torch.float32 if args.use_fsdp else self.weight_dtype)
         self.transformer = add_lora(self.transformer, args.lora_rank, adapter_name="student")
         self.transformer = add_lora_adapter(self.transformer, args.lora_rank, adapter_name="fake")
         maybe_resume_dmd_adapters(self.transformer, args)
         self.transformer.set_adapter("student")
         for name, param in self.transformer.named_parameters():
             param.requires_grad_(("student" in name or "fake" in name) and "lora_" in name)
-        cast_training_params([self.transformer], dtype=self.weight_dtype if args.use_fsdp else torch.float32)
+        cast_training_params([self.transformer], dtype=torch.float32)
         self.transformer.print_trainable_parameters()
 
     def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
@@ -131,7 +130,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         current_null_embeds, _ = pad_embedding(self.null_conditioning, max_tokens=num_text_tokens)
         current_null_layers = [pad_embedding(layer, max_tokens=num_text_tokens)[0] for layer in self.null_conditioning_layers]
 
-        do_gen_update = self.global_step % self.args.dfake_gen_update_ratio == 0
+        do_gen_update = (self.global_step + 1) % self.args.dfake_gen_update_ratio == 0
 
         gen_kwargs = dict(
             encoder_hidden_states=eh,
@@ -148,7 +147,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         # via x0_pred = x_t - sigma * v. On non-gen-update steps, roll the full trajectory.
         with CudaTimerContext(generate_time):
             if do_gen_update:
-                grad_step_idx = random.randint(0, len(infer_timesteps) - 1)
+                selected_step = torch.randint(low=0, high=len(infer_timesteps), size=(1,), device=device, dtype=torch.long)
+                selected_step = broadcast(selected_step, from_process=0)
+                grad_step_idx = int(selected_step.item())
             else:
                 grad_step_idx = len(infer_timesteps)
             with torch.no_grad():
@@ -219,14 +220,13 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         log_every = self.args.dmd_log_image_every
         if (
             log_every > 0
-            and do_gen_update
             and self.accelerator.is_main_process
             and self.vae is not None
             and (self.global_step + 1) % log_every == 0
         ):
             wandb_extras = self._build_image_logs(
                 generated_latents=generated_latents,
-                dm_update=dmd_outputs["log_latents"]["dm_update"],
+                dmd_log_latents=dmd_outputs["log_latents"] if do_gen_update else None,
                 captions=batch.captions,
                 height=height,
                 width=width,
@@ -242,8 +242,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 "fetch_batch": fetch_time_sec,
             },
             "log_extras": {
-                "gen_update": int(do_gen_update),
-                "grad_step_idx": grad_step_idx if do_gen_update else -1,
+                "do_gen_update": int(do_gen_update),
+                "grad_step_idx": grad_step_idx,
             },
             "wandb_extras": wandb_extras,
         }
@@ -253,7 +253,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self,
         *,
         generated_latents: torch.Tensor,
-        dm_update: torch.Tensor,
+        dmd_log_latents: dict | None,
         captions,
         height: int,
         width: int,
@@ -274,11 +274,6 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 self.args.do_patching,
             )
 
-        gen_img = _decode(generated_latents)
-        update_img = _decode(dm_update)
-        # Center the DM-update visualization at 0.5 for viewability.
-        update_img = (update_img * 0.5 + 0.5).clamp(0, 1)
-
         def _to_wandb_list(t):
             arr = (t * 255).clamp(0, 255).to(torch.uint8).cpu().permute(0, 2, 3, 1).numpy()
             return [
@@ -289,7 +284,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 for i in range(arr.shape[0])
             ]
 
-        return {
-            "dmd/generated": _to_wandb_list(gen_img),
-            "dmd/dm_update": _to_wandb_list(update_img),
-        }
+        img_logs = {"dmd/generated": _to_wandb_list(_decode(generated_latents))}
+        for key, latents in (dmd_log_latents or {}).items():
+            img_logs[f"dmd/{key}"] = _to_wandb_list(_decode(latents))
+        return img_logs

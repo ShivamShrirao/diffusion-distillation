@@ -1,4 +1,7 @@
+from contextlib import contextmanager
+
 from peft import LoraConfig, PeftModel, get_peft_model
+from peft.tuners.lora.layer import LoraLayer
 
 
 _TARGET_MODULES = [
@@ -49,18 +52,37 @@ def load_lora(transformer, input_dir: str, is_trainable: bool = False, adapter_n
 
 
 def set_adapter(transformer, adapter_name: str):
-    """Set the active LoRA adapter, unwrapping FSDP/DDP if needed."""
+    """Set the active LoRA adapter without touching ``requires_grad``.
+
+    PEFT's ``PeftModel.set_adapter`` flips ``requires_grad=False`` on every adapter
+    that's not the new active one — and PyTorch's ``AccumulateGrad`` checks
+    ``requires_grad`` at backward time, so a mid-step switch can silently drop the
+    inactive adapter's gradients (DMD's student/fake setup hit this). We mutate
+    ``_active_adapter`` directly on each ``LoraLayer`` instead: same forward routing,
+    no grad mutation.
+    """
     module = transformer.module if hasattr(transformer, "module") else transformer
-    if hasattr(module, "set_adapter"):
-        module.set_adapter(adapter_name)
+    target = [adapter_name]
+    for sub in module.modules():
+        if isinstance(sub, LoraLayer):
+            sub._active_adapter = target
 
 
+@contextmanager
 def disable_adapter(transformer):
     """Context manager: run with all LoRA adapters disabled (skips lora_A/lora_B matmul).
 
-    Use this instead of ``joint_attention_kwargs["scale"] = 0.0`` — it produces a leaner
-    compiled graph (no zero-multiplied lora compute) and is compile-cache-friendly
-    because Dynamo guards on the bool ``disable_adapters`` rather than a float scale.
+    PEFT's ``PeftModel.disable_adapter`` also flips ``requires_grad=False`` on all
+    adapter params on entry and only restores grads on the *active* adapter on exit —
+    that's the same silent-grad-drop hazard as ``set_adapter``. We just toggle
+    ``LoraLayer._disable_adapters`` directly.
     """
     module = transformer.module if hasattr(transformer, "module") else transformer
-    return module.disable_adapter()
+    layers = [m for m in module.modules() if isinstance(m, LoraLayer)]
+    for layer in layers:
+        layer._disable_adapters = True
+    try:
+        yield
+    finally:
+        for layer in layers:
+            layer._disable_adapters = False

@@ -19,7 +19,6 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     BackwardPrefetch,
     FullOptimStateDictConfig,
     FullStateDictConfig,
-    ShardingStrategy,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
@@ -47,7 +46,7 @@ def build_accelerator(args, weight_dtype):
         fsdp_plugin = FullyShardedDataParallelPlugin(
             state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
             optim_state_dict_config=FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            reshard_after_forward="FULL_SHARD",
             auto_wrap_policy=functools.partial(
                 transformer_auto_wrap_policy,
                 transformer_layer_cls={BriaFibo2TransformerBlock},
@@ -97,6 +96,9 @@ def compile_transformer(transformer, transformer_unwrapped, regional: bool = Fal
     `regional=True` compiles each transformer block individually (cheaper recompile on
     shape changes); otherwise the full module is compiled.
     """
+    # DMD switches no_grad / LoRA _disable_adapters / _active_adapter mid-step,
+    # each of which invalidates dynamo guards. Default cap of 8 isn't enough.
+    torch._dynamo.config.recompile_limit = 64
     if regional:
         for i in range(len(transformer_unwrapped.noise_refiner)):
             transformer_unwrapped.noise_refiner[i] = torch.compile(

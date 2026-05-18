@@ -73,6 +73,7 @@ def add_base_args(parser):
     parser.add_argument("--vae_gradient_checkpointing", type=int, default=0)
     parser.add_argument("--lora_rank", type=int, default=0)
     parser.add_argument("--wandb_name", type=str, default="run")
+    parser.add_argument("--wandb_project", type=str, default="", help="wandb project; empty = no wandb.")
     parser.add_argument("--do_patching", type=int, default=1)
     parser.add_argument("--use_torch_compile", type=int, default=0)
     parser.add_argument("--regional_compile", type=int, default=0)

@@ -33,16 +33,16 @@ def add_decoupled_dmd_args(parser):
         help="Weight for classifier-alignment component.",
     )
     parser.add_argument(
+        "--dmd_ca_min_step",
+        type=int,
+        default=20,
+        help="Minimum timestep sampled for the classifier-alignment component.",
+    )
+    parser.add_argument(
         "--dmd_dm_weight",
         type=float,
         default=1.0,
         help="Weight for distribution-matching component.",
-    )
-    parser.add_argument(
-        "--dmd_max_timestep",
-        type=int,
-        default=980,
-        help="Maximum DMD timestep in [0, 1000].",
     )
     parser.add_argument(
         "--dfake_gen_update_ratio",

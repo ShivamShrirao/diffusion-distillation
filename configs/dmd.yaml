@@ -4,6 +4,7 @@ pretrained_model_name_or_path: briaai/Fibo-2.0-dev
 json_data_input_path: data_input.json
 checkpoint_local_path: checkpoints/dmd
 output_dir: output/dmd
+wandb_project: dmd
 wandb_name: dmd
 seed: 42
 mixed_precision: bf16

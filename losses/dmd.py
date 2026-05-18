@@ -1,6 +1,5 @@
 """Decoupled DMD loss for flow-matching transformers.
 
-The flow-matching velocity is not the same as the score, so we follow the original
 DMD/DMD2 formulation and work in x0 space:
 
     z_sigma = (1 - sigma) * x0 + sigma * eps
@@ -29,17 +28,6 @@ def x0_from_v(noisy: torch.Tensor, pred_v: torch.Tensor, timesteps: torch.Tensor
     return noisy - sigmas * pred_v
 
 
-def sample_ca_timesteps(generator_timesteps: torch.Tensor, max_timestep: int) -> torch.Tensor:
-    """Per-sample uniform in [0, min(generator_timestep, max_timestep + 1)). Vectorized."""
-    upper = generator_timesteps.long().clamp(max=max_timestep + 1)
-    r = torch.rand(upper.shape, device=upper.device)
-    return (r * upper.float()).long()
-
-
-def sample_dm_timesteps(batch_size: int, max_timestep: int, device) -> torch.Tensor:
-    return torch.randint(0, max_timestep + 1, (batch_size,), device=device, dtype=torch.long)
-
-
 def replicate_attn_mask(attn_kwargs: dict, n: int) -> dict:
     out = dict(attn_kwargs or {})
     am = out.get("attention_mask")
@@ -64,12 +52,13 @@ def compute_decoupled_dmd_loss(
     args,
 ) -> dict:
     batch_size = generated_latents.shape[0]
-    max_timestep = int(args.dmd_max_timestep)
     device = generated_latents.device
 
     with torch.no_grad():
-        ca_timesteps = sample_ca_timesteps(generator_timesteps, max_timestep)
-        dm_timesteps = sample_dm_timesteps(batch_size, max_timestep, device)
+        # Per-sample uniform in [dmd_ca_min_step, generator_timestep).
+        ca_upper = generator_timesteps.long()
+        ca_timesteps = (torch.rand(ca_upper.shape, device=ca_upper.device) * (ca_upper - args.dmd_ca_min_step).float()).long() + args.dmd_ca_min_step
+        dm_timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
 
         ca_noisy = add_flow_noise(generated_latents, ca_timesteps)
         dm_noisy = add_flow_noise(generated_latents, dm_timesteps)
@@ -98,9 +87,6 @@ def compute_decoupled_dmd_loss(
             )
         real_ca_cond_v, real_ca_uncond_v, real_dm_cond_v = real_pred.chunk(3, dim=0)
 
-        # Conditional-only fake forward: the fake adapter is trained on cond inputs in
-        # compute_fake_score_loss, so a CFG uncond pass would be both wasted compute and
-        # an out-of-distribution input for the adapter.
         set_adapter(fake_transformer, "fake")
         fake_dm_cond_v, _ = fake_transformer(
             hidden_states=dm_noisy.to(dtype=model_dtype),
@@ -118,12 +104,15 @@ def compute_decoupled_dmd_loss(
         real_dm_cond_x0 = x0_from_v(dm_noisy, real_dm_cond_v, dm_timesteps)
         fake_dm_cond_x0 = x0_from_v(dm_noisy, fake_dm_cond_v, dm_timesteps)
 
+        # DMD2 normalization: divide each gradient direction by its own
+        # per-sample magnitude, so the post-norm update has unit L1 magnitude and
+        # the loss scale is constant across timesteps.
         ca_update = (args.dmd_real_guidance_scale - 1.0) * (real_ca_cond_x0 - real_ca_uncond_x0)
-        ca_norm = (real_ca_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
+        ca_norm = ca_update.abs().mean(dim=(1, 2), keepdim=True)
         ca_update = ca_update / (ca_norm + 1e-8)
 
         dm_update = real_dm_cond_x0 - fake_dm_cond_x0
-        dm_norm = (real_dm_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
+        dm_norm = dm_update.abs().mean(dim=(1, 2), keepdim=True)
         dm_update = dm_update / (dm_norm + 1e-8)
 
     loss_ca = F.mse_loss(
@@ -141,16 +130,16 @@ def compute_decoupled_dmd_loss(
     return {
         "loss": loss,
         "named_losses": {
-            "dmd": loss,
-            "dmd_ca": loss_ca,
-            "dmd_dm": loss_dm,
-            "dmd_ca_norm": ca_norm.detach().mean(),
-            "dmd_dm_norm": dm_norm.detach().mean(),
-            "dmd_ca_timestep": ca_timesteps.float().mean(),
-            "dmd_dm_timestep": dm_timesteps.float().mean(),
+            "dmd_loss": loss,
+            "dmd_ca_loss": loss_ca,
+            "dmd_dm_loss": loss_dm,
+            "dmd_ca_norm_mean": ca_norm.mean(),
         },
         "log_latents": {
             "dm_update": dm_update.detach(),
+            "real_ca_cfg_x0": (real_ca_uncond_x0 + args.dmd_real_guidance_scale * (real_ca_cond_x0 - real_ca_uncond_x0)).detach(),
+            "real_dm_cond_x0": real_dm_cond_x0.detach(),
+            "fake_dm_cond_x0": fake_dm_cond_x0.detach(),
         },
     }
 
@@ -169,7 +158,7 @@ def compute_fake_score_loss(
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
 
-    timesteps = sample_dm_timesteps(batch_size, int(args.dmd_max_timestep), device)
+    timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
     clean_latents = generated_latents.detach()
     noise = torch.randn_like(clean_latents)
     sigmas = (timesteps.float() / 1000.0).view(-1, 1, 1).to(device=device, dtype=clean_latents.dtype)
@@ -190,10 +179,10 @@ def compute_fake_score_loss(
     set_adapter(transformer, "student")
 
     fake_loss = F.mse_loss(fake_pred.float(), target_v.float(), reduction="mean") * args.dmd_fake_loss_scale
+
     return {
         "loss": fake_loss,
         "named_losses": {
-            "dmd_fake": fake_loss,
-            "dmd_fake_timestep": timesteps.float().mean(),
+            "dmd_fake_loss": fake_loss,
         },
     }

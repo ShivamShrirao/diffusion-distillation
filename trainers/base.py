@@ -13,7 +13,6 @@ Subclasses declare (as class attributes):
   - ``PARSER_MIXINS``        : list of ``add_*_args(parser)`` functions
   - ``BATCH_CLS``            : the ``@dataclass`` for the dataloader tuple
   - ``DATALOADER_BUILDER``   : staticmethod returning ``(get_dataloader, total_batch)``
-  - ``WANDB_PROJECT``        : str
 
 And override these hooks:
   - ``extra_setup()``        : load extra models (teachers, rewards).
@@ -33,6 +32,7 @@ import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
+from typing import Callable, Optional
 
 import argparse
 import diffusers
@@ -112,7 +112,6 @@ class BaseTrainer:
     PARSER_MIXINS: list = [add_base_args, add_data_args]
     BATCH_CLS = T2IBatch
     DATALOADER_BUILDER = staticmethod(build_dataloader_t2i)
-    WANDB_PROJECT: str = "image-model"
 
     def __init__(self):
         # Populated by setup()
@@ -126,7 +125,7 @@ class BaseTrainer:
         self.total_num_layers: int | None = None
         self.tokenizer = None
         self.text_encoder = None
-        self.get_prompt_embedds = None
+        self.get_prompt_embedds: Optional[Callable] = None
         self.parameters = None
         self.optimizer = None
         self.lr_scheduler = None
@@ -174,9 +173,9 @@ class BaseTrainer:
         if args.lora_rank > 0:
             logger.info(f"Using LoRA with rank {args.lora_rank}")
             self.transformer.requires_grad_(False)
-            self.transformer.to(dtype=self.weight_dtype)
+            self.transformer.to(dtype=torch.float32 if args.use_fsdp else self.weight_dtype)
             self.transformer = add_lora(self.transformer, args.lora_rank)
-            cast_training_params([self.transformer], dtype=self.weight_dtype if args.use_fsdp else torch.float32)
+            cast_training_params([self.transformer], dtype=torch.float32)
             self.transformer.print_trainable_parameters()
         else:
             self.transformer.requires_grad_(True)
@@ -247,6 +246,7 @@ class BaseTrainer:
             self.vae_config,
             logger,
         )
+        self.vae_scale_factor = vae_scale_factor_from_config(self.vae_config)
         self.compute_mfu_constants()
         self.lr_scheduler = build_lr_scheduler(self.args, self.optimizer, self.accelerator.num_processes)
 
@@ -272,7 +272,7 @@ class BaseTrainer:
             )
 
         if self.accelerator.is_main_process:
-            init_wandb(self.accelerator, self.args, project_name=self.WANDB_PROJECT)
+            init_wandb(self.accelerator, self.args, project_name=self.args.wandb_project)
 
         logger.info("***** Running training *****")
         logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
@@ -290,7 +290,6 @@ class BaseTrainer:
         assert null_emb.shape[0] == 1
         self.null_conditioning = null_emb.repeat(self.args.train_batch_size, 1, 1).to(dtype=torch.float32)
         self.null_conditioning_layers = [layer.repeat(self.args.train_batch_size, 1, 1).to(dtype=torch.float32) for layer in null_layers]
-        self.vae_scale_factor = vae_scale_factor_from_config(self.vae_config)
         self.generator = torch.Generator(device=self.accelerator.device).manual_seed(self.seed)
         assert self.total_batch_no_acc is not None
         self.loss_coeff = WORLD_SIZE / self.total_batch_no_acc
@@ -397,7 +396,7 @@ class BaseTrainer:
 
         return {
             "loss": denoising_loss,
-            "named_losses": {"denoising": denoising_loss},
+            "named_losses": {"denoising_loss": denoising_loss},
             "timings": {
                 "text_encoder_time": text_encoder_time,
                 "forward_time": forward_time[0],
@@ -447,7 +446,15 @@ class BaseTrainer:
 
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(self.parameters, self.args.max_grad_norm)
+                    if self.args.use_fsdp:
+                        # FSDP needs its own clip_grad_norm_ on the wrapped module: it
+                        # all-reduces local shard norms across ranks so every rank scales
+                        # by the same factor. accelerator.clip_grad_norm_ with a filtered
+                        # parameter list falls through to torch.nn.utils which only sees
+                        # local shards and clips inconsistently per rank.
+                        self.transformer.clip_grad_norm_(self.args.max_grad_norm)
+                    else:
+                        self.accelerator.clip_grad_norm_(self.parameters, self.args.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
@@ -524,7 +531,7 @@ class BaseTrainer:
             if self.peak_flops_per_sec:
                 log_params["mfu"] = achieved / self.peak_flops_per_sec
         for k, v in self.named_loss_acc.items():
-            log_params[f"train_{k}_loss"] = _item(v)
+            log_params[f"train_{k}"] = _item(v)
         wandb.log({**log_params, **(outputs.get("wandb_extras") or {})}, step=self.global_step)
         logger.info(f"train_loss: {log_params['train_loss']}")
 
@@ -622,6 +629,7 @@ class BaseTrainer:
 
     @staticmethod
     def print_cuda_info():
+        print(f"PyTorch version: {torch.__version__}")
         print(f"PyTorch CUDA Version: {torch.version.cuda}")
         try:
             out = subprocess.run(

@@ -1,10 +1,18 @@
+"""PEFT-based LoRA helpers for non-DMD trainers.
+
+DMD training uses the static multi-adapter wrapper in
+``lora/static_multi_lora.py`` — that path does NOT go through PEFT and does
+not use these helpers. Everything here is the stock PEFT API for trainers
+(DPO, draft, kl_lora, etc.) that need a single adapter.
+"""
+
 from contextlib import contextmanager
 
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora.layer import LoraLayer
 
 
-_TARGET_MODULES = [
+LORA_TARGET_MODULES = (
     # Attention (self and cross) and SwiGLU feed-forward of every block
     "to_k",
     "to_q",
@@ -13,29 +21,31 @@ _TARGET_MODULES = [
     "feed_forward.w1",
     "feed_forward.w2",
     "feed_forward.w3",
-]
+)
 
 
-def has_lora(transformer, adapter_name: str = "default") -> bool:
-    return isinstance(transformer, PeftModel) and adapter_name in getattr(transformer, "peft_config", {})
+def _resolve_lora_alpha(lora_rank: int, lora_alpha: int | None) -> int:
+    if lora_alpha is None or lora_alpha < 0:
+        return 2 * lora_rank
+    return lora_alpha
 
 
-def add_lora(transformer, lora_rank: int, adapter_name: str = "default"):
+def add_lora(transformer, lora_rank: int, adapter_name: str = "default", lora_alpha: int | None = None):
     lora_config = LoraConfig(
         r=lora_rank,
-        lora_alpha=2 * lora_rank,
+        lora_alpha=_resolve_lora_alpha(lora_rank, lora_alpha),
         init_lora_weights="gaussian",
-        target_modules=_TARGET_MODULES,
+        target_modules=list(LORA_TARGET_MODULES),
     )
     return get_peft_model(transformer, lora_config, adapter_name=adapter_name)
 
 
-def add_lora_adapter(transformer, lora_rank: int, adapter_name: str):
+def add_lora_adapter(transformer, lora_rank: int, adapter_name: str, lora_alpha: int | None = None):
     lora_config = LoraConfig(
         r=lora_rank,
-        lora_alpha=2 * lora_rank,
+        lora_alpha=_resolve_lora_alpha(lora_rank, lora_alpha),
         init_lora_weights="gaussian",
-        target_modules=_TARGET_MODULES,
+        target_modules=list(LORA_TARGET_MODULES),
     )
     transformer.add_adapter(adapter_name, lora_config)
     return transformer
@@ -51,34 +61,18 @@ def load_lora(transformer, input_dir: str, is_trainable: bool = False, adapter_n
     )
 
 
-def set_adapter(transformer, adapter_name: str):
-    """Set the active LoRA adapter without touching ``requires_grad``.
-
-    PEFT's ``PeftModel.set_adapter`` flips ``requires_grad=False`` on every adapter
-    that's not the new active one — and PyTorch's ``AccumulateGrad`` checks
-    ``requires_grad`` at backward time, so a mid-step switch can silently drop the
-    inactive adapter's gradients (DMD's student/fake setup hit this). We mutate
-    ``_active_adapter`` directly on each ``LoraLayer`` instead: same forward routing,
-    no grad mutation.
-    """
-    module = transformer.module if hasattr(transformer, "module") else transformer
-    target = [adapter_name]
-    for sub in module.modules():
-        if isinstance(sub, LoraLayer):
-            sub._active_adapter = target
+def _root_module(transformer):
+    return transformer.module if hasattr(transformer, "module") else transformer
 
 
 @contextmanager
 def disable_adapter(transformer):
-    """Context manager: run with all LoRA adapters disabled (skips lora_A/lora_B matmul).
-
-    PEFT's ``PeftModel.disable_adapter`` also flips ``requires_grad=False`` on all
-    adapter params on entry and only restores grads on the *active* adapter on exit —
-    that's the same silent-grad-drop hazard as ``set_adapter``. We just toggle
-    ``LoraLayer._disable_adapters`` directly.
+    """Disable all LoRA adapters for the duration of the context (no-grad
+    paths only — used by ref-model evaluations in kl_lora / DPO). Flips
+    ``_disable_adapters`` on every PEFT LoraLayer and restores on exit.
     """
-    module = transformer.module if hasattr(transformer, "module") else transformer
-    layers = [m for m in module.modules() if isinstance(m, LoraLayer)]
+    root = _root_module(transformer)
+    layers = [m for m in root.modules() if isinstance(m, LoraLayer)]
     for layer in layers:
         layer._disable_adapters = True
     try:

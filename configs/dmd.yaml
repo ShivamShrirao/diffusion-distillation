@@ -15,10 +15,10 @@ learning_rate: 0.00001
 lr_scheduler: constant_with_warmup
 lr_warmup_steps: 100
 max_grad_norm: 1.0
-use_torch_compile: 1
 regional_compile: 1
 checkpointing_steps: 100
 lora_rank: 64
+lora_alpha: 64
 denoising_loss_scale: 0.0
 
 dmd_num_inference_steps: "4"

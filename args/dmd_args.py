@@ -56,3 +56,9 @@ def add_decoupled_dmd_args(parser):
         default=20,
         help="Decode and log generated / teacher x0 / fake x0 / DM-update images every N global steps. 0 disables (also skips loading the VAE weights).",
     )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.0,
+        help="EMA decay for the student/fake LoRA shadow. Saved as a side ema/ subdir per checkpoint. 0 disables.",
+    )

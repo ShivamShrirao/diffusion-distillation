@@ -32,6 +32,12 @@ def add_base_args(parser):
         help="Fibo 2.0 diffusers repo (transformer, text_encoder, processor, vae).",
     )
     parser.add_argument(
+        "--lora_init",
+        type=str,
+        default=None,
+        help="Optional DMD checkpoint dir to cold-start the student and fake adapters from.",
+    )
+    parser.add_argument(
         "--transformer_init",
         type=str,
         default=None,
@@ -40,6 +46,7 @@ def add_base_args(parser):
     parser.add_argument("--seed", type=int, default=10, help="Seed for reproducible training.")
     parser.add_argument("--max_sequence_length", type=int, default=4096, help="Max sequence length for text encoder.")
     parser.add_argument("--train_batch_size", type=int, default=2)
+    parser.add_argument("--global_step", type=int, default=0, help="Initial optimizer step for logs, loop offset, and checkpoint numbering.")
     parser.add_argument("--max_train_steps", type=int, default=10_000_000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -72,10 +79,11 @@ def add_base_args(parser):
     parser.add_argument("--gradient_checkpointing", type=int, default=0)
     parser.add_argument("--vae_gradient_checkpointing", type=int, default=0)
     parser.add_argument("--lora_rank", type=int, default=0)
+    parser.add_argument("--lora_alpha", type=int, default=-1, help="LoRA alpha. -1 means use 2 * lora_rank (legacy default).")
     parser.add_argument("--wandb_name", type=str, default="run")
     parser.add_argument("--wandb_project", type=str, default="", help="wandb project; empty = no wandb.")
     parser.add_argument("--do_patching", type=int, default=1)
-    parser.add_argument("--use_torch_compile", type=int, default=0)
+    parser.add_argument("--full_torch_compile", type=int, default=0)
     parser.add_argument("--regional_compile", type=int, default=0)
     parser.add_argument(
         "--denoising_loss_scale",

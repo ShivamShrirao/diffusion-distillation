@@ -126,9 +126,8 @@ class BaseTrainer:
         self.tokenizer = None
         self.text_encoder = None
         self.get_prompt_embedds: Optional[Callable] = None
-        self.parameters = None
-        self.optimizer = None
-        self.lr_scheduler = None
+        self.optimizer = []
+        self.lr_scheduler = []
         self.get_dataloader = None
         self.total_batch_no_acc: int | None = None
         self.null_conditioning = None
@@ -248,23 +247,23 @@ class BaseTrainer:
         )
         self.vae_scale_factor = vae_scale_factor_from_config(self.vae_config)
         self.compute_mfu_constants()
-        self.lr_scheduler = build_lr_scheduler(self.args, self.optimizer, self.accelerator.num_processes)
 
         if self.args.use_fsdp:
-            self.optimizer, self.lr_scheduler = self.accelerator.prepare(
-                self.optimizer,
-                self.lr_scheduler,
-            )
+            num_optimizers = len(self.optimizer)
+            prepared = self.accelerator.prepare(*self.optimizer, *self.lr_scheduler)
+            self.optimizer = list(prepared[:num_optimizers])
+            self.lr_scheduler = list(prepared[num_optimizers:])
         else:
-            self.transformer, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
-                self.transformer,
-                self.optimizer,
-                self.lr_scheduler,
-            )
+            num_optimizers = len(self.optimizer)
+            prepared = self.accelerator.prepare(self.transformer, *self.optimizer, *self.lr_scheduler)
+            self.transformer = prepared[0]
+            prepared = prepared[1:]
+            self.optimizer = list(prepared[:num_optimizers])
+            self.lr_scheduler = list(prepared[num_optimizers:])
 
         self.post_optimizer_setup()
 
-        if self.args.use_torch_compile:
+        if self.args.full_torch_compile or self.args.regional_compile:
             compile_transformer(
                 self.transformer,
                 self.transformer_unwrapped,
@@ -278,7 +277,7 @@ class BaseTrainer:
         logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {self.args.max_train_steps}")
 
-        self.global_step = int(os.environ.get("GLOBAL_STEP", 0))
+        self.global_step = self.args.global_step
         if self.args.resume_from_checkpoint != "no":
             self.global_step = load_checkpoint(self.accelerator, self.args)
             self.global_step = self.maybe_adjust_resume_step(self.global_step)
@@ -296,18 +295,17 @@ class BaseTrainer:
         self.transformer.train()
 
     def build_optimizer(self):
-        if self.args.lora_rank > 0:
-            self.parameters = list(filter(lambda p: p.requires_grad, self.transformer.parameters()))
-        else:
-            self.parameters = self.transformer.parameters()
-        self.optimizer = torch.optim.AdamW(
-            self.parameters,
+        parameters = [p for p in self.transformer.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(
+            parameters,
             lr=self.args.learning_rate,
             betas=(self.args.adam_beta1, self.args.adam_beta2),
             weight_decay=self.args.adam_weight_decay,
             eps=self.args.adam_epsilon,
             fused=True,
         )
+        self.optimizer = [optimizer]
+        self.lr_scheduler = [build_lr_scheduler(self.args, optimizer, self.accelerator.num_processes)]
 
     def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
         """Simple T2I flow-matching denoising step.
@@ -405,6 +403,32 @@ class BaseTrainer:
             },
         }
 
+    def optimization_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
+        """Run one optimizer step for the default single-loss training path.
+
+        Subclasses with multiple optimizers or phase-specific backward passes can
+        override this while keeping the shared outer loop, logging, and checkpoint
+        cadence intact.
+        """
+        outputs = self.training_step(batch, fetch_time_sec=fetch_time_sec)
+        loss = outputs["loss"]
+        self.accumulate_step_outputs(outputs)
+
+        self.accelerator.backward(loss)
+        if self.accelerator.sync_gradients:
+            grad_norm = self.accelerator.clip_grad_norm_(self.transformer.parameters(), self.args.max_grad_norm)
+            outputs.setdefault("log_extras", {})["grad_norm"] = grad_norm
+        for optimizer in self.optimizer:
+            optimizer.step()
+        for lr_scheduler in self.lr_scheduler:
+            lr_scheduler.step()
+        for optimizer in self.optimizer:
+            optimizer.zero_grad()
+        if self.ema_lora is not None and self.accelerator.sync_gradients:
+            self.ema_lora.update()
+
+        return outputs
+
     # ---------------------------------------------------------------
     # Main loop
     # ---------------------------------------------------------------
@@ -440,26 +464,8 @@ class BaseTrainer:
 
             # ----- step -----
             with self.accelerator.accumulate(self.transformer):
-                outputs = self.training_step(batch, fetch_time_sec=fetch_time_sec)
+                outputs = self.optimization_step(batch, fetch_time_sec=fetch_time_sec)
                 loss = outputs["loss"]
-                self.accumulate_step_outputs(outputs)
-
-                self.accelerator.backward(loss)
-                if self.accelerator.sync_gradients:
-                    if self.args.use_fsdp:
-                        # FSDP needs its own clip_grad_norm_ on the wrapped module: it
-                        # all-reduces local shard norms across ranks so every rank scales
-                        # by the same factor. accelerator.clip_grad_norm_ with a filtered
-                        # parameter list falls through to torch.nn.utils which only sees
-                        # local shards and clips inconsistently per rank.
-                        self.transformer.clip_grad_norm_(self.args.max_grad_norm)
-                    else:
-                        self.accelerator.clip_grad_norm_(self.parameters, self.args.max_grad_norm)
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                self.optimizer.zero_grad()
-                if self.ema_lora is not None and self.accelerator.sync_gradients:
-                    self.ema_lora.update()
 
             # ----- per-sync admin (log, save, increment) -----
             if self.accelerator.sync_gradients:
@@ -521,7 +527,7 @@ class BaseTrainer:
             "train_loss": _item(self.train_loss),
             "num_processes": self.accelerator.num_processes,
             "batch_time_sec": batch_time_sec,
-            "learning_rate": self.optimizer.param_groups[0]["lr"],
+            **{f"learning_rate_{idx}": optimizer.param_groups[0]["lr"] for idx, optimizer in enumerate(self.optimizer)},
             **(outputs.get("timings") or {}),
             **{k: _item(v) for k, v in (outputs.get("log_extras") or {}).items()},
         }

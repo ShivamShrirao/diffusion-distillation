@@ -6,8 +6,16 @@ DMD/DMD2 formulation and work in x0 space:
     v       = eps - x0
     x0_hat  = z_sigma - sigma * v_pred
 
-The DM gradient direction is `x0_real - x0_fake` and the per-sample magnitude
-normalization is `|x0_real - generator_output|.mean()` (DMD2 weighting trick).
+The DM gradient direction is `x0_real - x0_fake` normalised to unit L1
+magnitude (DMD2 weighting trick); the CA gradient direction is
+`(rgs - 1) * (x0_real_cond - x0_real_uncond)` normalised the same way.
+
+Active LoRA adapter per forward is selected via an explicit
+`lora_scales` tensor passed through `joint_attention_kwargs`. The
+transformer's checkpoint wrapper threads this tensor through the
+gradient-checkpoint boundary so backward recompute uses the same scales as
+the original forward (mutating module state between forward and backward
+would otherwise corrupt the recomputed activations).
 """
 
 from __future__ import annotations
@@ -15,7 +23,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from lora.adapters import disable_adapter, set_adapter
+from lora.static_multi_lora import make_scales
 
 
 def add_flow_noise(x0: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
@@ -53,6 +61,8 @@ def compute_decoupled_dmd_loss(
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
+    fake_scales = make_scales("fake", fake_transformer, device=device)
+    disabled_scales = make_scales(None, real_transformer, device=device)
 
     with torch.no_grad():
         # Per-sample uniform in [dmd_ca_min_step, generator_timestep).
@@ -74,20 +84,19 @@ def compute_decoupled_dmd_loss(
         real_enc = torch.cat([cond_h, uncond_h, cond_h], dim=0)
         real_layers = [torch.cat([cl, ul, cl], dim=0) for cl, ul in zip(cond_l, uncond_l)]
         real_attn = replicate_attn_mask(attn_kwargs, 3)
+        real_attn["lora_scales"] = disabled_scales
 
-        with disable_adapter(real_transformer):
-            real_pred, _ = real_transformer(
-                hidden_states=real_latents,
-                timestep=real_timesteps.to(device=real_latents.device, dtype=torch.float32),
-                encoder_hidden_states=real_enc,
-                text_encoder_layers=real_layers,
-                img_ids=img_ids,
-                return_dict=False,
-                joint_attention_kwargs=real_attn,
-            )
+        real_pred, _ = real_transformer(
+            hidden_states=real_latents,
+            timestep=real_timesteps.to(device=real_latents.device, dtype=torch.float32),
+            encoder_hidden_states=real_enc,
+            text_encoder_layers=real_layers,
+            img_ids=img_ids,
+            return_dict=False,
+            joint_attention_kwargs=real_attn,
+        )
         real_ca_cond_v, real_ca_uncond_v, real_dm_cond_v = real_pred.chunk(3, dim=0)
 
-        set_adapter(fake_transformer, "fake")
         fake_dm_cond_v, _ = fake_transformer(
             hidden_states=dm_noisy.to(dtype=model_dtype),
             timestep=dm_timesteps.to(device=dm_noisy.device, dtype=torch.float32),
@@ -95,24 +104,20 @@ def compute_decoupled_dmd_loss(
             text_encoder_layers=cond_l,
             img_ids=img_ids,
             return_dict=False,
-            joint_attention_kwargs=attn_kwargs,
+            joint_attention_kwargs={**(attn_kwargs or {}), "lora_scales": fake_scales},
         )
-        set_adapter(fake_transformer, "student")
 
         real_ca_cond_x0 = x0_from_v(ca_noisy, real_ca_cond_v, ca_timesteps)
         real_ca_uncond_x0 = x0_from_v(ca_noisy, real_ca_uncond_v, ca_timesteps)
         real_dm_cond_x0 = x0_from_v(dm_noisy, real_dm_cond_v, dm_timesteps)
         fake_dm_cond_x0 = x0_from_v(dm_noisy, fake_dm_cond_v, dm_timesteps)
 
-        # DMD2 normalization: divide each gradient direction by its own
-        # per-sample magnitude, so the post-norm update has unit L1 magnitude and
-        # the loss scale is constant across timesteps.
         ca_update = (args.dmd_real_guidance_scale - 1.0) * (real_ca_cond_x0 - real_ca_uncond_x0)
-        ca_norm = ca_update.abs().mean(dim=(1, 2), keepdim=True)
+        ca_norm = (real_ca_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
         ca_update = ca_update / (ca_norm + 1e-8)
 
         dm_update = real_dm_cond_x0 - fake_dm_cond_x0
-        dm_norm = dm_update.abs().mean(dim=(1, 2), keepdim=True)
+        dm_norm = (real_dm_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
         dm_update = dm_update / (dm_norm + 1e-8)
 
     loss_ca = F.mse_loss(
@@ -134,10 +139,10 @@ def compute_decoupled_dmd_loss(
             "dmd_ca_loss": loss_ca,
             "dmd_dm_loss": loss_dm,
             "dmd_ca_norm_mean": ca_norm.mean(),
+            "dmd_dm_norm_mean": dm_norm.mean(),
         },
         "log_latents": {
             "dm_update": dm_update.detach(),
-            "real_ca_cfg_x0": (real_ca_uncond_x0 + args.dmd_real_guidance_scale * (real_ca_cond_x0 - real_ca_uncond_x0)).detach(),
             "real_dm_cond_x0": real_dm_cond_x0.detach(),
             "fake_dm_cond_x0": fake_dm_cond_x0.detach(),
         },
@@ -157,6 +162,7 @@ def compute_fake_score_loss(
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
+    fake_scales = make_scales("fake", transformer, device=device)
 
     timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
     clean_latents = generated_latents.detach()
@@ -165,7 +171,6 @@ def compute_fake_score_loss(
     noisy_latents = sigmas * noise + (1.0 - sigmas) * clean_latents
     target_v = noise - clean_latents
 
-    set_adapter(transformer, "fake")
     noisy_latents = noisy_latents.to(dtype=model_dtype)
     fake_pred, _ = transformer(
         hidden_states=noisy_latents,
@@ -174,9 +179,8 @@ def compute_fake_score_loss(
         text_encoder_layers=[layer.to(dtype=model_dtype) for layer in cond_layers],
         img_ids=img_ids,
         return_dict=False,
-        joint_attention_kwargs=attn_kwargs,
+        joint_attention_kwargs={**(attn_kwargs or {}), "lora_scales": fake_scales},
     )
-    set_adapter(transformer, "student")
 
     fake_loss = F.mse_loss(fake_pred.float(), target_v.float(), reduction="mean") * args.dmd_fake_loss_scale
 

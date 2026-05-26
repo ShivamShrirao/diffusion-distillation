@@ -97,6 +97,17 @@ def set_lora_scales(module, scales):
             sub._lora_scales = scales
 
 
+def build_transformer_config(args, vae_config: dict, logger) -> dict:
+    transformer_config = dict(
+        Fibo2Transformer2DModel.load_config(args.pretrained_model_name_or_path, subfolder="transformer")
+    )
+    assert vae_config["latent_channels"] == transformer_config["in_channels"]
+
+    logger.info("------- Transformer Config ---------")
+    logger.info(transformer_config)
+    return transformer_config
+
+
 def load_transformer_init_weights(transformer, transformer_init: str, logger):
     if os.path.exists(f"{transformer_init}/pytorch_model.bin"):
         ckpt_path = f"{transformer_init}/pytorch_model.bin"

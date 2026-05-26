@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from lora.static_multi_lora import make_scales
+from lora.static_multi_lora import StaticMultiLoraLinear, make_scales
 
 
 def add_flow_noise(x0: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
@@ -61,8 +61,13 @@ def compute_decoupled_dmd_loss(
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
-    fake_scales = make_scales("fake", fake_transformer, device=device)
-    disabled_scales = make_scales(None, real_transformer, device=device)
+    # LoRA mode binds all three roles (real/fake/student) to one transformer via
+    # ``lora_scales``. Full-FT passes distinct modules — detect that and skip the
+    # scales kwarg entirely (the pre-hook ignores absent keys, and full-FT modules
+    # have no StaticMultiLoraLinear so make_scales would raise).
+    use_lora_scales = real_transformer is fake_transformer
+    fake_scales = make_scales("fake", fake_transformer, device=device) if use_lora_scales else None
+    disabled_scales = make_scales(None, real_transformer, device=device) if use_lora_scales else None
 
     with torch.no_grad():
         # Per-sample uniform in [dmd_ca_min_step, generator_timestep).
@@ -84,7 +89,8 @@ def compute_decoupled_dmd_loss(
         real_enc = torch.cat([cond_h, uncond_h, cond_h], dim=0)
         real_layers = [torch.cat([cl, ul, cl], dim=0) for cl, ul in zip(cond_l, uncond_l)]
         real_attn = replicate_attn_mask(attn_kwargs, 3)
-        real_attn["lora_scales"] = disabled_scales
+        if disabled_scales is not None:
+            real_attn["lora_scales"] = disabled_scales
 
         real_pred, _ = real_transformer(
             hidden_states=real_latents,
@@ -97,6 +103,9 @@ def compute_decoupled_dmd_loss(
         )
         real_ca_cond_v, real_ca_uncond_v, real_dm_cond_v = real_pred.chunk(3, dim=0)
 
+        fake_attn_kwargs = {**(attn_kwargs or {})}
+        if fake_scales is not None:
+            fake_attn_kwargs["lora_scales"] = fake_scales
         fake_dm_cond_v, _ = fake_transformer(
             hidden_states=dm_noisy.to(dtype=model_dtype),
             timestep=dm_timesteps.to(device=dm_noisy.device, dtype=torch.float32),
@@ -104,7 +113,7 @@ def compute_decoupled_dmd_loss(
             text_encoder_layers=cond_l,
             img_ids=img_ids,
             return_dict=False,
-            joint_attention_kwargs={**(attn_kwargs or {}), "lora_scales": fake_scales},
+            joint_attention_kwargs=fake_attn_kwargs,
         )
 
         real_ca_cond_x0 = x0_from_v(ca_noisy, real_ca_cond_v, ca_timesteps)
@@ -162,7 +171,11 @@ def compute_fake_score_loss(
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
-    fake_scales = make_scales("fake", transformer, device=device)
+    # Full-FT: ``transformer`` is the dedicated fake module with no StaticMultiLoraLinear,
+    # so skip the scales lookup. LoRA mode: ``transformer`` carries both adapters and the
+    # "fake" scales pick the right one.
+    use_lora_scales = any(isinstance(sub, StaticMultiLoraLinear) for sub in transformer.modules())
+    fake_scales = make_scales("fake", transformer, device=device) if use_lora_scales else None
 
     timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
     clean_latents = generated_latents.detach()
@@ -172,6 +185,9 @@ def compute_fake_score_loss(
     target_v = noise - clean_latents
 
     noisy_latents = noisy_latents.to(dtype=model_dtype)
+    fake_attn_kwargs = {**(attn_kwargs or {})}
+    if fake_scales is not None:
+        fake_attn_kwargs["lora_scales"] = fake_scales
     fake_pred, _ = transformer(
         hidden_states=noisy_latents,
         timestep=timesteps.to(device=noisy_latents.device, dtype=torch.float32),
@@ -179,7 +195,7 @@ def compute_fake_score_loss(
         text_encoder_layers=[layer.to(dtype=model_dtype) for layer in cond_layers],
         img_ids=img_ids,
         return_dict=False,
-        joint_attention_kwargs={**(attn_kwargs or {}), "lora_scales": fake_scales},
+        joint_attention_kwargs=fake_attn_kwargs,
     )
 
     fake_loss = F.mse_loss(fake_pred.float(), target_v.float(), reduction="mean") * args.dmd_fake_loss_scale

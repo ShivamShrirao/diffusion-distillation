@@ -97,6 +97,37 @@ def add_base_args(parser):
         default=0.1,
         help="Probability of dropping prompt to null at training time (T2I CFG).",
     )
+    # --- Validation (periodic full-inference sampling on a fixed prompt set) ---
+    parser.add_argument(
+        "--validate_every",
+        type=int,
+        default=0,
+        help="Run full inference on a fixed prompt set every N global steps and log the samples to wandb under val/. 0 disables. Requires the trainer to implement generate_validation_latents().",
+    )
+    parser.add_argument(
+        "--validation_prompts_path",
+        type=str,
+        default="",
+        help="Validation prompts source: a dir of per-prompt JSON files (globbed) or a single JSON file holding a list of prompts. Required for --validate_every.",
+    )
+    parser.add_argument(
+        "--validation_num_prompts",
+        type=int,
+        default=8,
+        help="Cap on how many validation prompts to run each validation pass.",
+    )
+    parser.add_argument(
+        "--validation_resolution",
+        type=int,
+        default=1024,
+        help="Square resolution (H=W) for the validation generations. Fixed across all ranks so the per-rank training aspect buckets don't make the gathered images shape-mismatch. Set to match the run's data resolution (e.g. 512 for the 512 datasets).",
+    )
+    parser.add_argument(
+        "--validation_seed",
+        type=int,
+        default=100050,
+        help="Fixed RNG seed for the validation noise. Same seed for every prompt and every pass so samples stay comparable across steps.",
+    )
     parser.add_argument(
         "--trainer",
         type=str,

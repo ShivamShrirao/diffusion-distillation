@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -11,11 +11,12 @@ import torch
 class T2IBatch:
     pixel_values: torch.Tensor  # (B, C, H, W) — VAE latents
     captions: List[str]
+    resolution: Optional[Tuple[int, int]] = None  # (height, width)
 
     @classmethod
     def from_tuple(cls, tup):
-        pixel_values, captions = tup
-        return cls(pixel_values=pixel_values, captions=captions)
+        pixel_values, captions, resolution = tup
+        return cls(pixel_values=pixel_values, captions=captions, resolution=resolution)
 
 
 def get_caption_short_description(caption):

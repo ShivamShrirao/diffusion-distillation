@@ -1,4 +1,7 @@
 import os
+import shutil
+import threading
+from pathlib import Path
 
 from accelerate.logging import get_logger
 
@@ -25,26 +28,55 @@ def resolve_resume_checkpoint(args):
     return full
 
 
-def load_checkpoint(accelerator, args) -> int:
-    """Resume `accelerator.state` from a checkpoint dir under `args.checkpoint_local_path`.
+class AsyncCheckpointSaver:
+    """Stage checkpoint dir on /dev/shm, then async-move it to the final destination.
 
-    Returns the global_step number to continue from (the saved step + 2, matching the
-    legacy behaviour the trainers rely on).
+    Usage:
+        with AsyncCheckpointSaver(final_save_path, is_main_process) as temp_path:
+            accelerator.save_state(temp_path)
+        # context exit kicks off the move
     """
-    full_path = resolve_resume_checkpoint(args)
-    if full_path is None:
-        accelerator.print(f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run.")
-        args.resume_from_checkpoint = None
-        return 0
 
-    accelerator.print(f"Resuming from checkpoint {full_path}")
-    # DMD checkpoints (both LoRA-adapter and full-FT) save each role under its own subdir
-    # (student/, fake/); their weights are loaded by DMDTrainer.configure_transformer
-    # before FSDP wrap, so skip the full-state load here.
-    if os.path.isdir(os.path.join(full_path, "student")):
-        accelerator.print("Detected DMD multi-module checkpoint; student/fake weights are loaded by DMDTrainer.configure_transformer.")
-    else:
-        accelerator.load_state(full_path, map_location="cpu")
-    global_step = int(os.path.basename(full_path).split("_")[-1])
-    global_step += 2
-    return global_step
+    _lock = threading.Lock()
+    _last_move_thread = None
+
+    def __init__(self, final_save_path: str, is_main_process: bool):
+        self.final_save_path = Path(final_save_path)
+        self.temp_dir = None
+        self.is_main_process = is_main_process
+
+    def __enter__(self):
+        checkpoint_name = self.final_save_path.name
+        self.temp_dir = Path("/dev/shm/") / checkpoint_name
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        return str(self.temp_dir)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.is_main_process:
+            return False
+        t = threading.Thread(
+            target=self._move_checkpoint,
+            args=(self.temp_dir, self.final_save_path),
+            daemon=False,
+        )
+        with AsyncCheckpointSaver._lock:
+            if AsyncCheckpointSaver._last_move_thread and AsyncCheckpointSaver._last_move_thread.is_alive():
+                AsyncCheckpointSaver._last_move_thread.join()
+            AsyncCheckpointSaver._last_move_thread = t
+        t.start()
+        return False
+
+    @staticmethod
+    def _move_checkpoint(temp_dir: Path, final_path: Path):
+        try:
+            _logger.info(f"Moving checkpoint from {temp_dir} to {final_path}")
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if final_path.exists():
+                shutil.rmtree(final_path)
+            shutil.move(str(temp_dir), str(final_path))
+            _logger.info(f"Successfully moved checkpoint from {temp_dir} to {final_path}")
+        except Exception as e:
+            _logger.error(f"Error moving checkpoint from {temp_dir} to {final_path}: {e}")
+        finally:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)

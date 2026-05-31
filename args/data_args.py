@@ -6,13 +6,13 @@ def add_data_args(parser):
         "--json_data_input_path",
         type=str,
         default="data_input.json.txt",
-        help="Path to the JSON describing per-rank data allocation.",
+        help="Path to the dataset JSON.",
     )
     parser.add_argument(
         "--resolution",
         type=int,
         default=256,
-        help="Training resolution (overridden by per-rank JSON allocation).",
+        help="Resolution for the synthetic --random_latents dataset; real data uses per-bucket resolution.",
     )
     parser.add_argument(
         "--random_latents",

@@ -2,24 +2,34 @@
 
 Each builder returns:
     `(get_dataloader: Callable[[], DataLoader], total_batch_no_acc: int)`
-and also mutates `args.train_batch_size` and `args.resolution` to the values resolved
-from the data input JSON for this rank.
+and mutates `args.train_batch_size` / `args.resolution` to representative values
+resolved from the data input.
+
+Resolution is always bucketed: every rank uses the same resolution on a given step,
+rotating through tar-count-weighted buckets so each step recompiles at most once per
+unique shape. The builders differ only in which keys they pull out of each record and
+what the collate produces — the scheduler / tar-loading / batching wiring is shared.
+
+`--random_latents` swaps the real tar source for a synthetic single-bucket stream and
+reuses the same preprocess / collate, so no data reads happen.
 """
 
 import glob
 import os
 import random
-from typing import Callable, List, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import torch
 import webdataset as wds
-from datasets import IterableDataset
 
-from data.json_data import json_to_data, total_batch_no_acc
+from data.json_data import ResolutionData, list_resolution_data
+from models.vae import vae_scale_factor_from_config
 
 
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+DYNAMIC_RESOLUTION_SCHEDULE_STEPS = 128
 
 
 def load_dataset_from_tars(
@@ -28,19 +38,33 @@ def load_dataset_from_tars(
     world_size: int,
     seed: int = 0,
     slice: bool = False,
+    tar_files: List[str] | None = None,
 ):
-    tar_files = []
-    for train_data_dir in training_dirs:
-        files = glob.glob(f"{train_data_dir}/*.tar")
-        print(f"We have {len(files)} data files on {train_data_dir}")
-        tar_files += files
+    if tar_files is None:
+        tar_files = []
+        for train_data_dir in training_dirs:
+            files = glob.glob(f"{train_data_dir}/*.tar")
+            print(f"We have {len(files)} data files on {train_data_dir}")
+            tar_files += files
+        print(f"We have {len(tar_files)} data files in total")
 
-    print(f"We have {len(tar_files)} data files in total")
+    tar_files = list(tar_files)
 
     if slice:
-        print("Using slicing")
-        tar_files = tar_files[rank::world_size]
-        print(f"Process {rank} will use data files {len(tar_files)} files")
+        all_tar_files = tar_files
+        tar_files = all_tar_files[rank::world_size]
+        if not tar_files and all_tar_files:
+            # If a tiny bucket has fewer shards than participating ranks, shard-level
+            # splitting cannot give every rank a unique tar. Fall back to a deterministic
+            # repeated shard instead of returning an empty stream.
+            tar_files = [all_tar_files[rank % len(all_tar_files)]]
+            print(
+                f"Process {rank} had no sliced files for world_size={world_size}; "
+                f"reusing one shard from {len(all_tar_files)} available files"
+            )
+
+    if not tar_files:
+        raise RuntimeError(f"No tar files found for training_dirs={training_dirs}")
 
     np.random.seed(seed)
     np.random.shuffle(tar_files)
@@ -58,91 +82,275 @@ def load_dataset_from_tars(
     ).decode("torch")
 
 
-def setup(args, default_dir, default_size, default_bs, logger):
-    """Resolve rank/seed/resolution/training_dirs/total_batch shared by every builder.
+def resolve_resolution(args) -> Tuple[int, int]:
+    """Return `(height, width)` from `args.resolution` (a scalar or `(h, w)` tuple)."""
+    if isinstance(args.resolution, (tuple, list)):
+        return tuple(args.resolution)
+    return (args.resolution, args.resolution)
 
-    Mutates `args.train_batch_size` and `args.resolution`. `default_size` is `(width, height)`.
-    Returns `(rank, seed, training_dirs, height, width, total_batch)`; `training_dirs` is None
-    when `args.random_latents` is set.
+
+@dataclass(frozen=True)
+class BucketSpec:
+    index: int
+    training_dir: str
+    tar_files: Tuple[str, ...]
+    width: int
+    height: int
+    batch_size: int
+    tar_count: int
+    token_count: int
+
+
+class DynamicResolutionScheduler:
+    """Deterministic weighted scheduler shared by every distributed rank."""
+
+    def __init__(
+        self,
+        buckets: List[BucketSpec],
+        world_size: int,
+        seed: int,
+        schedule_steps: int,
+    ):
+        if not buckets:
+            raise ValueError("DynamicResolutionScheduler requires at least one bucket")
+        self.buckets = buckets
+        self.world_size = world_size
+        self.seed = seed
+        self.groups = self._build_groups(buckets)
+        min_steps = len(self.groups)
+        self.schedule_steps = max(1, schedule_steps, min_steps)
+        self.group_schedule = self._build_group_schedule()
+
+    @staticmethod
+    def _build_groups(buckets: List[BucketSpec]) -> List[List[BucketSpec]]:
+        groups: Dict[int, List[BucketSpec]] = {}
+        for bucket in buckets:
+            groups.setdefault(bucket.token_count, []).append(bucket)
+        return [groups[k] for k in sorted(groups.keys())]
+
+    @staticmethod
+    def _allocate_counts(weights: List[int], total_slots: int) -> List[int]:
+        if len(weights) > total_slots:
+            raise ValueError(f"Cannot allocate {len(weights)} groups into {total_slots} schedule slots")
+        weight_sum = sum(weights)
+        raw = [w * total_slots / weight_sum for w in weights]
+        counts = [max(1, int(v)) for v in raw]
+        while sum(counts) > total_slots:
+            candidates = [(raw[i] - counts[i], i) for i in range(len(counts)) if counts[i] > 1]
+            _, idx = min(candidates)
+            counts[idx] -= 1
+        needed = total_slots - sum(counts)
+        if needed > 0:
+            remainders = sorted([(raw[i] - int(raw[i]), i) for i in range(len(counts))], reverse=True)
+            for _, idx in remainders[:needed]:
+                counts[idx] += 1
+        return counts
+
+    def _build_group_schedule(self) -> List[int]:
+        total_slots = self.schedule_steps
+        group_weights = [sum(b.tar_count for b in group) for group in self.groups]
+        counts = self._allocate_counts(group_weights, total_slots)
+        schedule = []
+        for group_idx, count in enumerate(counts):
+            schedule.extend([group_idx] * count)
+        rng = random.Random(self.seed)
+        rng.shuffle(schedule)
+        return schedule
+
+    def _choose_bucket(self, group: List[BucketSpec], step: int) -> BucketSpec:
+        if len(group) == 1:
+            return group[0]
+        rng = random.Random(self.seed + 1_000_003 * step)
+        total = sum(bucket.tar_count for bucket in group)
+        pick = rng.randrange(total)
+        running = 0
+        for bucket in group:
+            running += bucket.tar_count
+            if pick < running:
+                return bucket
+        return group[-1]
+
+    def bucket_for_step(self, step: int) -> BucketSpec:
+        group_idx = self.group_schedule[step % len(self.group_schedule)]
+        return self._choose_bucket(self.groups[group_idx], step)
+
+
+class DynamicResolutionBatchIterator:
+    def __init__(self, scheduler, rank, seed, preprocess_fn, collate_fn, start_step=0):
+        self.scheduler = scheduler
+        self.rank = rank
+        self.seed = seed
+        self.preprocess_fn = preprocess_fn
+        self.collate_fn = collate_fn
+        self.step = start_step
+        self.iterators = {}
+        self.epochs = {}
+
+    def __iter__(self):
+        return self
+
+    def _iterator_key(self, bucket: BucketSpec):
+        return (bucket.index, self.rank, self.scheduler.world_size)
+
+    def _make_iterator(self, bucket: BucketSpec):
+        key = self._iterator_key(bucket)
+        epoch = self.epochs.get(key, 0)
+        current_seed = self.seed + 10_007 * bucket.index + epoch
+        ds = load_dataset_from_tars(
+            training_dirs=[bucket.training_dir],
+            rank=self.rank,
+            world_size=self.scheduler.world_size,
+            seed=current_seed,
+            slice=True,
+            tar_files=list(bucket.tar_files),
+        )
+        ds = ds.shuffle(10000, rng=random.Random(current_seed))
+        return iter(ds.map(lambda record: self.preprocess_fn(record, bucket)))
+
+    def _next_example(self, bucket: BucketSpec):
+        key = self._iterator_key(bucket)
+        if key not in self.iterators:
+            self.iterators[key] = self._make_iterator(bucket)
+        while True:
+            try:
+                return next(self.iterators[key])
+            except StopIteration:
+                self.epochs[key] = self.epochs.get(key, 0) + 1
+                self.iterators[key] = self._make_iterator(bucket)
+
+    def __next__(self):
+        bucket = self.scheduler.bucket_for_step(self.step)
+        examples = [self._next_example(bucket) for _ in range(bucket.batch_size)]
+        self.step += 1
+        return self.collate_fn(examples, bucket)
+
+
+def _latent_token_count(width: int, height: int, vae_scale_factor: int, do_patching: int) -> int:
+    if do_patching:
+        return (height // (vae_scale_factor * 2)) * (width // (vae_scale_factor * 2))
+    return (height // vae_scale_factor) * (width // vae_scale_factor)
+
+
+def build_dynamic_scheduler(args, vae_config, logger):
+    vae_scale_factor = vae_scale_factor_from_config(vae_config)
+    entries: List[ResolutionData] = list_resolution_data(args.json_data_input_path)
+    buckets = []
+    for entry in entries:
+        tar_files = tuple(sorted(glob.glob(f"{entry.training_dir}/*.tar")))
+        tar_count = len(tar_files)
+        if tar_count <= 0:
+            logger.warning(f"Skipping dynamic bucket {entry.width}x{entry.height}: no tars under {entry.training_dir}")
+            continue
+        buckets.append(
+            BucketSpec(
+                index=len(buckets),
+                training_dir=entry.training_dir,
+                tar_files=tar_files,
+                width=entry.width,
+                height=entry.height,
+                batch_size=entry.batch_size,
+                tar_count=tar_count,
+                token_count=_latent_token_count(entry.width, entry.height, vae_scale_factor, args.do_patching),
+            )
+        )
+    if not buckets:
+        raise RuntimeError(f"No non-empty dynamic resolution buckets found in {args.json_data_input_path}")
+
+    scheduler = DynamicResolutionScheduler(
+        buckets=buckets,
+        world_size=WORLD_SIZE,
+        seed=args.seed,
+        schedule_steps=DYNAMIC_RESOLUTION_SCHEDULE_STEPS,
+    )
+    group_desc = []
+    for group in scheduler.groups:
+        group_desc.append(
+            {
+                "tokens": group[0].token_count,
+                "resolutions": [f"{b.width}x{b.height}@bs{b.batch_size}" for b in group],
+                "tars": sum(b.tar_count for b in group),
+            }
+        )
+    logger.info(
+        "Dynamic resolution buckets: "
+        f"batch_sizes={sorted({b.batch_size for b in buckets})}, "
+        f"schedule_steps={scheduler.schedule_steps}, "
+        "all ranks use the same resolution per step, "
+        f"groups={group_desc}"
+    )
+    return scheduler, buckets[0].batch_size
+
+
+class SyntheticBatchIterator:
+    """Infinite synthetic batches for `--random_latents` (no data reads).
+
+    Reuses a builder's `preprocess` / `collate` against a single fixed bucket, so the
+    synthetic path produces the exact same batch shape as the real dynamic loader.
     """
+
+    def __init__(self, bucket: BucketSpec, build_sample, preprocess_fn, collate_fn):
+        self.bucket = bucket
+        self.build_sample = build_sample
+        self.preprocess_fn = preprocess_fn
+        self.collate_fn = collate_fn
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        examples = [self.preprocess_fn(self.build_sample(), self.bucket) for _ in range(self.bucket.batch_size)]
+        return self.collate_fn(examples, self.bucket)
+
+
+def build_dynamic_dataloader(args, vae_config, logger, preprocess, collate) -> Tuple[Callable, int]:
+    """Wire the tar-count-weighted resolution scheduler to a builder's preprocess/collate."""
+    if args.dataloader_num_workers > 1:
+        raise ValueError("dynamic resolution buckets require dataloader_num_workers <= 1")
     rank = int(os.environ.get("RANK", 0))
     seed = args.seed + rank
-    logger.info("Overriding Batch size with dynamic batch")
-    logger.info(f"Hello, Im Rank {rank}, from world size {WORLD_SIZE}")
-
-    if not args.random_latents:
-        if WORLD_SIZE > 1:
-            td, _, width, height, batch_size = json_to_data(rank, json_file=args.json_data_input_path)
-            args.train_batch_size = batch_size
-            training_dirs = [td]
-        else:
-            training_dirs = [default_dir]
-            width, height = default_size
-            args.train_batch_size = default_bs
-        assert len(training_dirs) == 1
-    else:
-        training_dirs = None
-        height, width = args.resolution if isinstance(args.resolution, tuple) else (args.resolution, args.resolution)
-
-    args.resolution = (height, width)
-
-    if not args.random_latents:
-        print(f"Rank {rank}: Chosen ratio is {training_dirs}, batch size is {args.train_batch_size} for resolution {width},{height}")
-    else:
-        print(f"Rank {rank}: Converting batch size to {args.train_batch_size} for resolution {width},{height}")
-
-    total_batch = total_batch_no_acc(args.json_data_input_path)
-    print(f"Total batch: {total_batch * args.gradient_accumulation_steps}")
-
-    return rank, seed, training_dirs, height, width, total_batch
-
-
-def tar_dataset_fn(training_dirs, rank):
-    def get_dataset(current_seed):
-        ds = load_dataset_from_tars(
-            training_dirs=training_dirs,
-            rank=rank,
-            world_size=WORLD_SIZE,
-            seed=current_seed,
-            slice=False,
-        )
-        return ds.shuffle(10000, rng=random.Random(current_seed))
-
-    return get_dataset
-
-
-def dummy_dataset_fn(build_sample, logger):
-    """Wrap a zero-arg `build_sample()` (returning a dict) into the IterableDataset pattern."""
-    logger.info("Using DummyPrecompute")
-
-    def get_dataset(current_seed):
-        def dataset_gen(current_seed):
-            data = build_sample()
-            while True:
-                yield data
-
-        return IterableDataset.from_generator(dataset_gen, gen_kwargs={"current_seed": current_seed})
-
-    return get_dataset
-
-
-def dataloader_fn(get_dataset, preprocess, collate_fn, args, seed, pin_memory=True):
-    rng = random.Random(seed)
+    scheduler, batch_size = build_dynamic_scheduler(args, vae_config, logger)
+    args.train_batch_size = batch_size
+    first_bucket = scheduler.buckets[0]
+    args.resolution = (first_bucket.height, first_bucket.width)
+    total_batch = WORLD_SIZE * batch_size
+    print(f"Rank {rank}: dynamic resolution buckets, batch size {batch_size}, total batch {total_batch}")
 
     def get_dataloader():
-        current_seed = rng.randint(0, 10**6)
-        train_dataset = get_dataset(current_seed).map(preprocess)
-        return torch.utils.data.DataLoader(
-            train_dataset,
-            collate_fn=collate_fn,
-            batch_size=args.train_batch_size,
-            num_workers=args.dataloader_num_workers,
-            drop_last=True,
-            prefetch_factor=None if args.debug else 4,
-            pin_memory=pin_memory,
+        start_step = int(getattr(args, "global_step", 0)) * int(getattr(args, "gradient_accumulation_steps", 1))
+        return DynamicResolutionBatchIterator(
+            scheduler=scheduler,
+            rank=rank,
+            seed=seed,
+            preprocess_fn=preprocess,
+            collate_fn=collate,
+            start_step=start_step,
         )
 
-    return get_dataloader
+    return get_dataloader, total_batch
+
+
+def build_random_dataloader(args, build_sample, preprocess, collate, logger) -> Tuple[Callable, int]:
+    """Single fixed-resolution synthetic stream sharing the dynamic preprocess/collate."""
+    logger.info("Using synthetic random-latents dataset (no data reads)")
+    height, width = resolve_resolution(args)
+    args.resolution = (height, width)
+    bucket = BucketSpec(
+        index=0,
+        training_dir="",
+        tar_files=(),
+        width=width,
+        height=height,
+        batch_size=args.train_batch_size,
+        tar_count=0,
+        token_count=0,
+    )
+    total_batch = WORLD_SIZE * bucket.batch_size
+    print(f"Rank {int(os.environ.get('RANK', 0))}: random latents, batch size {bucket.batch_size} for resolution {width}x{height}")
+
+    def get_dataloader():
+        return SyntheticBatchIterator(bucket, build_sample, preprocess, collate)
+
+    return get_dataloader, total_batch
 
 
 # ---------------------------------------------------------------------------
@@ -151,44 +359,33 @@ def dataloader_fn(get_dataset, preprocess, collate_fn, args, seed, pin_memory=Tr
 
 
 def build_dataloader_t2i(args, vae_config, logger) -> Tuple[Callable, int]:
-    rank, seed, training_dirs, height, width, total_batch = setup(
-        args,
-        default_dir="data/256x256",
-        default_size=(256, 256),
-        default_bs=2,
-        logger=logger,
-    )
-    h, w = args.resolution
-
-    def preprocess(record):
+    def preprocess(record, bucket: BucketSpec):
         if "pickle" in record:
             record = record["pickle"]
+        width, height = bucket.width, bucket.height
         example = {"caption": record["caption"]}
         if f"latents_{width}_{height}" in record:
             example["pixel_values"] = record[f"latents_{width}_{height}"]
         elif f"good_latents_{width}_{height}" in record:
             example["pixel_values"] = record[f"good_latents_{width}_{height}"]
         else:
-            raise Exception("latents not found in record")
+            raise Exception(f"latents not found in record for resolution {width}x{height}")
         return example
 
-    def collate_fn(examples):
+    def collate(examples, bucket: BucketSpec):
         captions = [e["caption"] for e in examples]
-        pixel_values = torch.stack([e["pixel_values"] for e in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        return pixel_values, captions
+        pixel_values = torch.stack([e["pixel_values"] for e in examples]).to(memory_format=torch.contiguous_format).float()
+        return pixel_values, captions, (bucket.height, bucket.width)
 
     if args.random_latents:
 
         def build_sample():
+            height, width = resolve_resolution(args)
             return {
-                f"latents_{width}_{height}": torch.randn([vae_config["latent_channels"], int(h / 8), int(w / 8)], dtype=torch.float32),
-                f"images_{width}_{height}": torch.randn([3, h, w], dtype=torch.float32),
+                f"latents_{width}_{height}": torch.randn([vae_config["latent_channels"], height // 8, width // 8], dtype=torch.float32),
                 "caption": "_".join(["hello"] * args.max_sequence_length),
             }
 
-        get_dataset = dummy_dataset_fn(build_sample, logger)
-    else:
-        get_dataset = tar_dataset_fn(training_dirs, rank)
+        return build_random_dataloader(args, build_sample, preprocess, collate, logger)
 
-    return dataloader_fn(get_dataset, preprocess, collate_fn, args, seed), total_batch
+    return build_dynamic_dataloader(args, vae_config, logger, preprocess, collate)

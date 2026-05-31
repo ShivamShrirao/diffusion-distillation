@@ -16,7 +16,7 @@ Subclasses declare (as class attributes):
 
 And override these hooks:
   - ``extra_setup()``        : load extra models (teachers, rewards).
-  - ``post_optimizer_setup()``: instantiate ``self.ema_lora`` if applicable
+  - ``post_optimizer_setup()``: instantiate ``self.ema_student`` if applicable
   - ``training_step(batch, *, fetch_time_sec)`` : the explicit step body.
         Must return a dict:
             ``loss``           : scalar tensor used by .backward()
@@ -28,6 +28,8 @@ And override these hooks:
 
 from __future__ import annotations
 
+import glob
+import json
 import os
 import shutil
 import subprocess
@@ -44,11 +46,11 @@ from tqdm.auto import tqdm
 
 from args.base_args import add_base_args, read_config_defaults
 from args.data_args import add_data_args
-from data.batch import T2IBatch
+from data.batch import T2IBatch, get_caption_short_description
 from data.build import build_dataloader_t2i
 from distributed import build_accelerator, compile_transformer, set_nccl_env
 from lora.adapters import add_lora
-from train_utils.checkpoint import load_checkpoint
+from train_utils.checkpoint import resolve_resume_checkpoint
 from train_utils.lr_scheduler import build_lr_scheduler
 from train_utils.runtime import (
     CudaTimerContext,
@@ -59,9 +61,9 @@ from train_utils.runtime import (
     setup_root_logger,
 )
 from losses.denoising import compute_denoising_loss
-from models.text_encoder import build_text_encoder, create_attention_matrix
+from models.text_encoder import build_text_encoder, create_attention_matrix, pad_embedding
 from models.transformer import build_transformer
-from models.vae import build_vae_config, vae_scale_factor_from_config
+from models.vae import build_vae_config, vae_scale_factor_from_config, decode_to_images
 from train_utils.packing import apply_cfg_dropout_t2i, pack_t2i, unpack_to_image
 
 
@@ -133,7 +135,7 @@ class BaseTrainer:
         self.null_conditioning = None
         self.null_conditioning_layers = None
         self.vae_scale_factor: int | None = None
-        self.ema_lora = None
+        self.ema_student = None
         self.generator = None
         self.transformer_param_count: int | None = None
         self.transformer_inner_dim: int | None = None
@@ -143,6 +145,7 @@ class BaseTrainer:
         self.seed: int | None = None
         self.rank: int = 0
         self.global_step: int = 0
+        self.val_prompts: list = []
         # Accumulators reset at every sync_gradients step.
         self.train_loss = 0.0
         self.named_loss_acc: dict[str, float] = {}
@@ -184,9 +187,6 @@ class BaseTrainer:
         """Runs after ``accelerator.prepare`` (so FSDP shards exist) and before
         ``torch.compile``. Use this to instantiate EMA-LoRA shadows or other
         live-parameter trackers."""
-
-    def maybe_adjust_resume_step(self, global_step: int) -> int:
-        return global_step + 1
 
     # ---------------------------------------------------------------
     # Setup
@@ -279,20 +279,33 @@ class BaseTrainer:
 
         self.global_step = self.args.global_step
         if self.args.resume_from_checkpoint != "no":
-            self.global_step = load_checkpoint(self.accelerator, self.args)
-            self.global_step = self.maybe_adjust_resume_step(self.global_step)
+            # Resume at the saved completed-step count; the next sync increments to step+1.
+            self.global_step = self.load_checkpoint()
 
         logger.info(f"Using adam with lr: {self.args.learning_rate}, beta2: {self.args.adam_beta2}")
 
         # Common derived state — everything `training_step` needs.
         null_emb, null_layers, _ = self.get_prompt_embedds([DEFAULT_NEGATIVE_PROMPT])
         assert null_emb.shape[0] == 1
-        self.null_conditioning = null_emb.repeat(self.args.train_batch_size, 1, 1).to(dtype=torch.float32)
-        self.null_conditioning_layers = [layer.repeat(self.args.train_batch_size, 1, 1).to(dtype=torch.float32) for layer in null_layers]
+        self.null_conditioning = null_emb.to(dtype=torch.float32)
+        self.null_conditioning_layers = [layer.to(dtype=torch.float32) for layer in null_layers]
         self.generator = torch.Generator(device=self.accelerator.device).manual_seed(self.seed)
         assert self.total_batch_no_acc is not None
+        # Representative default; recomputed per step in `main_loop` from the actual batch size.
         self.loss_coeff = WORLD_SIZE / self.total_batch_no_acc
+        self.val_prompts = self.load_validation_prompts()
         self.transformer.train()
+
+    def null_conditioning_for(self, bsz: int, num_text_tokens: int):
+        """Null (empty-prompt) CFG embeddings padded to `num_text_tokens`, sized to `bsz`.
+
+        For explicit-uncond consumers (paired 1:1 with the conditional batch); the
+        broadcasting `torch.where` consumers use `self.null_conditioning` directly.
+        """
+        emb, _ = pad_embedding(self.null_conditioning, max_tokens=num_text_tokens)
+        emb = emb.repeat(bsz, 1, 1)
+        layers = [pad_embedding(layer, max_tokens=num_text_tokens)[0].repeat(bsz, 1, 1) for layer in self.null_conditioning_layers]
+        return emb, layers
 
     def build_optimizer(self):
         parameters = [p for p in self.transformer.parameters() if p.requires_grad]
@@ -312,7 +325,7 @@ class BaseTrainer:
 
         Subclasses override this entirely for other objectives.
         """
-        height, width = self.args.resolution
+        height, width = batch.resolution or self.args.resolution
         device = self.accelerator.device
 
         # ---- text encoder ----
@@ -412,7 +425,7 @@ class BaseTrainer:
         """
         outputs = self.training_step(batch, fetch_time_sec=fetch_time_sec)
         loss = outputs["loss"]
-        self.accumulate_step_outputs(outputs)
+        self.record_loss_components(outputs)
 
         self.accelerator.backward(loss)
         if self.accelerator.sync_gradients:
@@ -424,8 +437,8 @@ class BaseTrainer:
             lr_scheduler.step()
         for optimizer in self.optimizer:
             optimizer.zero_grad()
-        if self.ema_lora is not None and self.accelerator.sync_gradients:
-            self.ema_lora.update()
+        if self.ema_student is not None and self.accelerator.sync_gradients:
+            self.ema_student.update()
 
         return outputs
 
@@ -461,6 +474,8 @@ class BaseTrainer:
                     logger.info(f"Rank {self.rank} reinit iterator")
                     epoch += 1
             batch = self.BATCH_CLS.from_tuple(raw_batch)
+            # Normalize the loss by the actual global batch (the resolution bucket for this
+            self.loss_coeff = WORLD_SIZE / (WORLD_SIZE * len(batch.captions))
 
             # ----- step -----
             with self.accelerator.accumulate(self.transformer):
@@ -476,11 +491,14 @@ class BaseTrainer:
                     now = datetime.now(timezone.utc)
                 self.reset_accumulators()
 
-                if (self.global_step - 1) % self.args.checkpointing_steps == 0 and (self.global_step - 1) > 0:
+                if self.global_step % self.args.checkpointing_steps == 0 and self.global_step > 0:
                     torch.cuda.synchronize()
                     self.accelerator.wait_for_everyone()
                     torch.cuda.empty_cache()
                     self.save_checkpoint()
+                    now = datetime.now(timezone.utc)
+
+                if self.maybe_validate():
                     now = datetime.now(timezone.utc)
 
             progress_bar.set_postfix(
@@ -509,7 +527,7 @@ class BaseTrainer:
     # ---------------------------------------------------------------
     # Logging
     # ---------------------------------------------------------------
-    def accumulate_step_outputs(self, outputs: dict):
+    def record_loss_components(self, outputs: dict):
         loss = outputs["loss"]
         self.train_loss += self.accelerator.gather(loss.detach()).mean() / self.args.gradient_accumulation_steps
         for k, v in (outputs.get("named_losses") or {}).items():
@@ -539,7 +557,6 @@ class BaseTrainer:
         for k, v in self.named_loss_acc.items():
             log_params[f"train_{k}"] = _item(v)
         wandb.log({**log_params, **(outputs.get("wandb_extras") or {})}, step=self.global_step)
-        logger.info(f"train_loss: {log_params['train_loss']}")
 
     def reset_accumulators(self):
         self.train_loss = 0.0
@@ -566,12 +583,153 @@ class BaseTrainer:
         return eh, te_layers, prompt_attn_mask, timer[0]
 
     # ---------------------------------------------------------------
+    # Validation (periodic full-inference sampling on a fixed prompt set)
+    # ---------------------------------------------------------------
+    def load_validation_prompts(self) -> list:
+        """Load the fixed validation prompt set once at setup.
+
+        Source is either a dir of per-prompt JSON files (globbed) or a
+        single JSON file holding a list of prompts (strings or JSON objects). Returns []
+        when validation is disabled or no path is set.
+        """
+        path = self.args.validation_prompts_path
+        if self.args.validate_every <= 0 or not path:
+            return []
+        limit = self.args.validation_num_prompts
+        if os.path.isdir(path):
+
+            def _key(p):
+                stem = os.path.splitext(os.path.basename(p))[0]
+                return int(stem) if stem.isdigit() else 1 << 30
+
+            files = sorted(glob.glob(os.path.join(path, "*.json")), key=_key)
+            prompts = []
+            for pf in files[:limit]:
+                with open(pf) as f:
+                    prompts.append(json.dumps(json.load(f), ensure_ascii=False))
+        else:
+            with open(path) as f:
+                data = json.load(f)
+            prompts = [p if isinstance(p, str) else json.dumps(p, ensure_ascii=False) for p in data][:limit]
+        logger.info(f"Loaded {len(prompts)} validation prompts from {path}")
+        return prompts
+
+    def maybe_validate(self) -> bool:
+        every = self.args.validate_every
+        if every <= 0 or self.global_step <= 0:
+            return False
+        # Validate at the first step (step 1) and every `every` steps after.
+        if self.global_step != 1 and self.global_step % every != 0:
+            return False
+        logger.info(f"Running validation at step {self.global_step}")
+        self.run_validation()
+        return True
+
+    def generate_validation_latents(self, caption: str, height: int, width: int, device) -> torch.Tensor | None:
+        return None
+
+    @torch.no_grad()
+    def run_validation(self):
+        """Generate samples on the fixed prompt set with the live student weights (logged
+        under ``val/samples``), and, if an EMA shadow exists, again with the EMA weights
+        swapped in (``val/samples_ema``)."""
+        if not self.val_prompts or self.vae is None:
+            return
+        if type(self).generate_validation_latents is BaseTrainer.generate_validation_latents:
+            if not getattr(self, "_val_hook_warned", False):
+                logger.warning(
+                    f"validate_every>0 but {type(self).__name__} does not implement generate_validation_latents(); skipping validation."
+                )
+                self._val_hook_warned = True
+            return
+
+        self._validation_pass("val/samples")
+
+        # EMA pass: swap the shadow into the live params in place (local per-shard op, no
+        # collective), regenerate, then restore. All ranks swap identically so the FSDP
+        # forwards stay in lockstep.
+        ema = self.ema_student
+        if ema is not None:
+            saved = ema.swap_in()
+            try:
+                self._validation_pass("val/samples_ema")
+            finally:
+                ema.swap_out(saved)
+
+    @torch.no_grad()
+    def _validation_pass(self, log_key: str):
+        """One full pass over the prompt set with the transformer's current weights.
+
+        Round-robins prompts across ranks, decodes locally, gathers to rank 0, logs under
+        ``log_key``. If the sampler runs FSDP-sharded modules, every forward all-gathers the
+        weights, so all ranks must issue the SAME number of forwards: the prompt list is
+        padded to a multiple of world_size (padded slots reuse prompt 0, carry index -1,
+        dropped after the gather). The VAE is local; each rank decodes at a single fixed
+        square resolution (validation_resolution) -> identical shapes -> clean gather.
+        """
+        device = self.accelerator.device
+        res = self.args.validation_resolution
+        height, width = res, res
+        world = self.accelerator.num_processes
+        rank = self.accelerator.process_index
+
+        prompts = list(self.val_prompts)
+        pad = (-len(prompts)) % world
+        padded_prompts = prompts + [prompts[0]] * pad
+        padded_indices = list(range(len(prompts))) + [-1] * pad
+
+        my_prompts = padded_prompts[rank::world]
+        my_indices = padded_indices[rank::world]
+
+        vae_dtype = next(self.vae.parameters()).dtype
+        my_images = []
+        for caption in my_prompts:
+            latents = self.generate_validation_latents(caption, height, width, device)
+            img = decode_to_images(self.vae, latents.to(dtype=vae_dtype), height, width, self.vae_scale_factor, self.vae_config, self.args.do_patching)
+            my_images.append(img)
+
+        # Equal slot count per rank -> equal shapes -> accelerator.gather concatenates cleanly.
+        images = torch.cat(my_images, dim=0).float().contiguous()  # (slots, 3, H, W)
+        idx_tensor = torch.tensor(my_indices, device=device, dtype=torch.long)
+        gathered_images = self.accelerator.gather(images)
+        gathered_indices = self.accelerator.gather(idx_tensor)
+
+        if not self.accelerator.is_main_process:
+            return
+        by_idx = {}
+        for img, idx in zip(gathered_images, gathered_indices.tolist()):
+            if idx < 0 or idx in by_idx:  # drop padding + duplicate slots
+                continue
+            by_idx[idx] = img
+        wandb_images = []
+        for idx in sorted(by_idx):
+            arr = (by_idx[idx] * 255).clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
+            wandb_images.append(wandb.Image(arr, caption=get_caption_short_description(self.val_prompts[idx])))
+        wandb.log({log_key: wandb_images}, step=self.global_step)
+
+    # ---------------------------------------------------------------
     # Checkpointing
     # ---------------------------------------------------------------
+    def load_checkpoint(self) -> int:
+        """Resume from the configured checkpoint dir; return its completed-step count
+        (``checkpoint_000500`` -> 500), or 0 if there's nothing to resume."""
+        full_path = resolve_resume_checkpoint(self.args)
+        if full_path is None:
+            self.accelerator.print(f"Checkpoint '{self.args.resume_from_checkpoint}' does not exist. Starting fresh.")
+            self.args.resume_from_checkpoint = None
+            return 0
+        self.accelerator.print(f"Resuming from checkpoint {full_path}")
+        self.load_checkpoint_state(full_path)
+        return int(os.path.basename(full_path).split("_")[-1])
+
+    def load_checkpoint_state(self, full_path: str):
+        """Load the full accelerate state from the resume dir. Override for custom layouts."""
+        self.accelerator.load_state(full_path, map_location="cpu")
+
     def save_checkpoint(self):
         save_path = os.path.join(
             self.args.checkpoint_local_path,
-            f"checkpoint_{self.global_step - 1:06d}",
+            f"checkpoint_{self.global_step:06d}",
         )
         if self.args.lora_rank > 0:
             if getattr(self.accelerator.state, "fsdp_plugin", None) is not None:
@@ -587,8 +745,8 @@ class BaseTrainer:
                 is_main_process=self.accelerator.is_main_process,
             )
             del state_dict
-            if self.ema_lora is not None:
-                self.ema_lora.save(save_path, self.accelerator, self.transformer)
+            if self.ema_student is not None:
+                self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped)
         else:
             self.accelerator.save_state(save_path)
 

@@ -171,8 +171,14 @@ def _normalise_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str,
     return {_clean_key(k): v for k, v in state_dict.items()}
 
 
-def load_peft_adapter(transformer: nn.Module, ckpt_dir: str, adapter_name: str) -> None:
-    sd_path = os.path.join(ckpt_dir, adapter_name, "adapter_model.safetensors")
+def load_peft_adapter(
+    transformer: nn.Module,
+    ckpt_dir: str,
+    adapter_name: str,
+    in_subdir: str | None = None,
+) -> None:
+    sub = adapter_name if in_subdir is None else in_subdir
+    sd_path = os.path.join(ckpt_dir, sub, "adapter_model.safetensors")
     if not os.path.exists(sd_path):
         raise FileNotFoundError(sd_path)
     peft_sd = load_file(sd_path)
@@ -226,6 +232,7 @@ def save_peft_adapter(
     ckpt_dir: str,
     adapter_name: str,
     state_dict: dict[str, torch.Tensor] | None = None,
+    out_subdir: str | None = None,
 ) -> None:
     own_sd = _normalise_state_dict_keys(state_dict if state_dict is not None else _root(transformer).state_dict())
     if missing := sorted(_adapter_state_keys(transformer, adapter_name) - set(own_sd)):
@@ -237,7 +244,8 @@ def save_peft_adapter(
     }
     if not peft_sd:
         raise RuntimeError(f"No LoRA keys found for adapter '{adapter_name}'")
-    out_dir = os.path.join(ckpt_dir, adapter_name)
+    sub = adapter_name if out_subdir is None else out_subdir
+    out_dir = os.path.join(ckpt_dir, sub)
     os.makedirs(out_dir, exist_ok=True)
     save_file(peft_sd, os.path.join(out_dir, "adapter_model.safetensors"))
     build_peft_lora_config(transformer, adapter_name).save_pretrained(out_dir)

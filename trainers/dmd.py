@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 
 import torch
+import shutil
 import wandb
 from accelerate.utils import broadcast
 from diffusers.training_utils import cast_training_params
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from args.base_args import add_base_args
 from args.data_args import add_data_args
@@ -23,13 +24,13 @@ from lora.static_multi_lora import (
     make_scales,
     save_peft_adapter,
 )
-from lora.ema import LoraEMA
+from train_utils.ema import FullFtEMA, LoraEMA
 from train_utils.checkpoint import resolve_resume_checkpoint
 from train_utils.lr_scheduler import build_lr_scheduler
 from train_utils.packing import pack_t2i
 from train_utils.runtime import CudaTimerContext
 from losses.dmd import compute_decoupled_dmd_loss, compute_fake_score_loss
-from models.text_encoder import create_attention_matrix, pad_embedding
+from models.text_encoder import create_attention_matrix
 from models.transformer import Fibo2Transformer2DModel, build_transformer_config
 from models.vae import build_vae, decode_to_images
 from schedulers.flow_matching import build_infer_scheduler, build_infer_timesteps
@@ -67,7 +68,9 @@ def _load_full_ft_weights(ckpt_dir: str) -> dict:
         path = os.path.join(ckpt_dir, fname)
         if os.path.exists(path):
             return load_file(path) if path.endswith(".safetensors") else torch.load(path, map_location="cpu", mmap=True)
-    raise FileNotFoundError(f"No transformer weights found in {ckpt_dir} (looked for diffusion_pytorch_model.safetensors / model.safetensors / pytorch_model.bin)")
+    raise FileNotFoundError(
+        f"No transformer weights found in {ckpt_dir} (looked for diffusion_pytorch_model.safetensors / model.safetensors / pytorch_model.bin)"
+    )
 
 
 def maybe_resume_dmd_full_ft(student_transformer, fake_transformer, args):
@@ -80,7 +83,8 @@ def maybe_resume_dmd_full_ft(student_transformer, fake_transformer, args):
     is disambiguated by ``args.lora_rank``).
     """
     ckpt_path = resolve_resume_checkpoint(args)
-    if ckpt_path is None:
+    cold_init = ckpt_path is None
+    if cold_init:
         # Reuse lora_init as the generic "cold-init from a saved DMD ckpt" path —
         # the trainer's mode (lora_rank) already disambiguates the layout.
         ckpt_path = args.lora_init
@@ -88,10 +92,11 @@ def maybe_resume_dmd_full_ft(student_transformer, fake_transformer, args):
             logger.info(f"Cold-initializing DMD full-FT student+fake from lora_init={ckpt_path}")
     if not ckpt_path or not os.path.isdir(os.path.join(ckpt_path, "student")) or not os.path.isdir(os.path.join(ckpt_path, "fake")):
         return False
-    logger.info(f"Loading DMD full-FT student+fake weights from {ckpt_path}")
+    logger.info(f"Loading DMD full-FT student weights from {os.path.join(ckpt_path, 'student')}")
     student_sd = _load_full_ft_weights(os.path.join(ckpt_path, "student"))
     student_transformer.load_state_dict(student_sd, assign=True)
     del student_sd
+    logger.info(f"Loading DMD full-FT fake weights from {os.path.join(ckpt_path, 'fake')}")
     fake_sd = _load_full_ft_weights(os.path.join(ckpt_path, "fake"))
     fake_transformer.load_state_dict(fake_sd, assign=True)
     del fake_sd
@@ -110,10 +115,11 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.fake_transformer_unwrapped = None
         self.real_transformer = None
         self.real_transformer_unwrapped = None
+        self.ema_student = None
 
     def extra_setup(self):
         self.infer_scheduler = build_infer_scheduler()
-        if self.args.dmd_log_image_every > 0:
+        if self.args.dmd_log_image_every > 0 or self.args.validate_every > 0:
             self.vae = build_vae(self.args, self.accelerator, self.weight_dtype)
 
     ADAPTER_NAMES = ("student", "fake")
@@ -144,16 +150,12 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         cast_training_params([self.transformer], dtype=torch.float32)
         n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.transformer.parameters())
-        logger.info(f"Trainable params: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.3f}%)")
+        logger.info(f"Trainable params: {n_trainable:,} / {n_total:,} ({100 * n_trainable / n_total:.3f}%)")
 
     def _configure_full_ft(self):
         """Build fake (trainable) and real (frozen) clones of the student, then FSDP-prepare
         all three. Under FSDP, only rank 0 holds materialised weights; other ranks stay on
         meta and receive weights via ``sync_module_states=True`` during ``prepare``.
-
-        Real teacher is always the cold pretrained weights from TRANSFORMER_INIT (frozen,
-        never updated). Student+fake start from those same weights at cold init, and get
-        overridden by the resume helper if a saved DMD full-FT checkpoint is available.
         """
         args = self.args
         logger.info("Using DMD full fine-tune mode (no LoRA): cloning student into fake + real transformers")
@@ -165,15 +167,10 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.fake_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
             self.real_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
 
-        # Copy student weights into the meta-built clones. Under FSDP this only runs on
-        # rank 0 (other ranks materialise empty shells in `prepare` via `param_init_fn`
-        # and pull the rank-0 weights through `sync_module_states`).
         is_rank0 = self.accelerator.is_main_process
         if (args.use_fsdp and is_rank0) or (not args.use_fsdp):
             src_sd = self.transformer.state_dict()
             self.real_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
-            # Cold-init fake from pretrained student. If a resume checkpoint exists, the
-            # next call overwrites both student and fake with the saved weights.
             self.fake_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
             del src_sd
             maybe_resume_dmd_full_ft(self.transformer, self.fake_transformer, args)
@@ -188,29 +185,12 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.real_transformer_unwrapped = self.real_transformer
 
         if args.use_fsdp:
-            # Prepare fake first (trainable, fp32) so it shards like student; real next
-            # (frozen, weight_dtype). Each call wraps independently — the student's own
-            # prepare still runs in base.setup after this returns.
             self.fake_transformer = self.accelerator.prepare(self.fake_transformer)
             self.real_transformer = self.accelerator.prepare(self.real_transformer)
 
         n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.transformer.parameters())
         logger.info(f"Full-FT student trainable params: {n_trainable:,} / {n_total:,}")
-
-    def post_optimizer_setup(self):
-        if self.args.lora_rank > 0 and self.args.ema_decay > 0:
-            self.ema_lora = LoraEMA(self.transformer, decay=self.args.ema_decay)
-            logger.info(
-                f"LoraEMA enabled with decay={self.args.ema_decay}, tracking {len(self.ema_lora.named_live)} LoRA params",
-            )
-        elif self.args.lora_rank == 0 and self.args.ema_decay > 0:
-            logger.info("EMA disabled under full-FT mode (LoraEMA only walks LoRA params)")
-
-        # In full-FT mode the student is compiled by base.setup; compile fake/real here.
-        if self.args.lora_rank == 0 and (self.args.full_torch_compile or self.args.regional_compile):
-            compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, regional=self.args.regional_compile)
-            compile_transformer(self.real_transformer, self.real_transformer_unwrapped, regional=self.args.regional_compile)
 
     def build_optimizer(self):
         if self.args.lora_rank == 0:
@@ -249,6 +229,18 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             build_lr_scheduler(self.args, fake_optimizer, self.accelerator.num_processes),
         ]
 
+    def post_optimizer_setup(self):
+        if self.args.lora_rank > 0 and self.args.ema_decay > 0:
+            self.ema_student = LoraEMA(self.transformer, decay=self.args.ema_decay, adapter_name="student")
+            logger.info(f"LoraEMA (student-only) enabled with decay={self.args.ema_decay}, tracking {len(self.ema_student.named_live)} LoRA params")
+        elif self.args.lora_rank == 0 and self.args.ema_decay > 0:
+            self.ema_student = FullFtEMA(self.transformer, decay=self.args.ema_decay)
+            logger.info(f"Full-FT student EMA enabled with decay={self.args.ema_decay}, tracking {self.ema_student.local_numel:,} local-shard params per rank")
+
+        if self.args.lora_rank == 0 and (self.args.full_torch_compile or self.args.regional_compile):
+            compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, regional=self.args.regional_compile)
+            compile_transformer(self.real_transformer, self.real_transformer_unwrapped, regional=self.args.regional_compile)
+
     def _clip_grad_norm(self, model):
         # In full-FT we prepare three same-arch FSDP modules; accelerator.clip_grad_norm_
         # crashes inside its dispatcher (tensor list `==`), so call FSDP's sharded clip directly.
@@ -271,7 +263,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             param.grad = grad
 
     def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
-        height, width = self.args.resolution
+        height, width = batch.resolution or self.args.resolution
         device = self.accelerator.device
 
         eh, te_layers, prompt_attn_mask, text_encoder_time = self.run_text_encoder(batch.captions)
@@ -284,14 +276,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         bsz = pixel_values.shape[0]
         num_text_tokens = eh.shape[1]
 
-        patched_latents, patched_image_ids = pack_t2i(
-            latents,
-            height,
-            width,
-            self.vae_scale_factor,
-            self.args.do_patching,
-            device,
-        )
+        patched_latents, patched_image_ids = pack_t2i(latents, height, width, self.vae_scale_factor, self.args.do_patching, device)
         latents_seq_len = patched_latents.shape[1]
         mask_time = [0.0]
         if bsz > 1:
@@ -308,22 +293,11 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer, device=device)
 
         num_inference_steps = self.args.dmd_num_inference_steps
-        infer_timesteps = build_infer_timesteps(
-            self.infer_scheduler,
-            num_inference_steps,
-            latents_seq_len,
-            device,
-        )
+        infer_timesteps = build_infer_timesteps(self.infer_scheduler, num_inference_steps, latents_seq_len, device)
 
-        generated_latents = torch.randn(
-            patched_latents.shape,
-            device=device,
-            dtype=patched_latents.dtype,
-            generator=self.generator,
-        )
+        generated_latents = torch.randn(patched_latents.shape, device=device, dtype=patched_latents.dtype, generator=self.generator)
 
-        current_null_embeds, _ = pad_embedding(self.null_conditioning, max_tokens=num_text_tokens)
-        current_null_layers = [pad_embedding(layer, max_tokens=num_text_tokens)[0] for layer in self.null_conditioning_layers]
+        current_null_embeds, current_null_layers = self.null_conditioning_for(bsz, num_text_tokens)
 
         do_gen_update = (self.global_step + 1) % self.args.dfake_gen_update_ratio == 0
 
@@ -336,50 +310,29 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         )
 
         generate_time = []
-        # DMD2 backward simulation: roll out under no_grad up to a randomly sampled step,
-        # then run one student forward with grad at that step so the DMD loss backprops
-        # via x0_pred = x_t - sigma * v. On non-gen-update steps, roll the full trajectory.
         with CudaTimerContext(generate_time):
-            if do_gen_update:
-                selected_step = torch.randint(low=0, high=len(infer_timesteps), size=(1,), device=device, dtype=torch.long)
-                selected_step = broadcast(selected_step, from_process=0)
-                grad_step_idx = int(selected_step.item())
-            else:
-                grad_step_idx = len(infer_timesteps)
+            selected_step = torch.randint(low=0, high=len(infer_timesteps), size=(1,), device=device, dtype=torch.long)
+            selected_step = broadcast(selected_step, from_process=0)
+            grad_step_idx = int(selected_step.item())
+
             with torch.no_grad():
                 for t in infer_timesteps[:grad_step_idx]:
-                    pred = predict_flow_step(
-                        self.transformer,
-                        generated_latents,
-                        t,
-                        **gen_kwargs,
-                    )
-                    generated_latents = self.infer_scheduler.step(
-                        pred,
-                        t,
-                        generated_latents,
-                        return_dict=False,
-                    )[0]
+                    pred = predict_flow_step(self.transformer, generated_latents, t, **gen_kwargs)
+                    generated_latents = self.infer_scheduler.step(pred, t, generated_latents, return_dict=False)[0]
 
-            if do_gen_update:
-                t_grad = infer_timesteps[grad_step_idx]
-                pred = predict_flow_step(
-                    self.transformer,
-                    generated_latents,
-                    t_grad,
-                    **gen_kwargs,
-                )
-                sigma = (t_grad.float() / 1000.0).to(device=device, dtype=generated_latents.dtype)
-                generated_latents = generated_latents - sigma * pred
-                generator_timesteps = t_grad.long().expand(generated_latents.shape[0]).to(device=device)
-            else:
-                generator_timesteps = None
+            t_grad = infer_timesteps[grad_step_idx]
+            with torch.set_grad_enabled(do_gen_update):
+                pred = predict_flow_step(self.transformer, generated_latents, t_grad, **gen_kwargs)
+            sigma = (t_grad.float() / 1000.0).to(device=device, dtype=generated_latents.dtype)
+            generated_latents = generated_latents - sigma * pred
+            generator_timesteps = t_grad.long().expand(generated_latents.shape[0]).to(device=device)
 
         return {
             "image": [height, width, device],
             "cond": [eh, te_layers, patched_image_ids, joint_attn_kwargs],
             "null": [current_null_embeds, current_null_layers],
             "rollout": [generated_latents, generator_timesteps, do_gen_update, grad_step_idx],
+            "real_latents": patched_latents,
             "timings": [text_encoder_time, generate_time[0], mask_time[0], fetch_time_sec],
         }
 
@@ -390,8 +343,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         current_null_embeds, current_null_layers = setup["null"]
         generated_latents, generator_timesteps, do_gen_update, grad_step_idx = setup["rollout"]
         text_encoder_time, generate_time, mask_time, fetch_time_sec = setup["timings"]
-        student_optimizer, fake_optimizer = self.optimizer
-        student_lr_scheduler, fake_lr_scheduler = self.lr_scheduler
+        student_optimizer, fake_optimizer = self.optimizer[0], self.optimizer[1]
+        student_lr_scheduler, fake_lr_scheduler = self.lr_scheduler[0], self.lr_scheduler[1]
 
         named_losses = {}
         dmd_outputs = None
@@ -421,9 +374,11 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             dmd_loss = dmd_outputs["loss"]
             dmd_named_losses = dmd_outputs.get("named_losses") or {}
             named_losses.update(dmd_named_losses)
-            self.accumulate_step_outputs({"loss": dmd_loss, "named_losses": dmd_named_losses})
+            self.record_loss_components({"loss": dmd_loss, "named_losses": dmd_named_losses})
 
-            self.accelerator.backward(dmd_loss)
+            student_loss = dmd_loss
+
+            self.accelerator.backward(student_loss)
             fake_grad_stash = None
             if self.accelerator.sync_gradients:
                 if self.args.lora_rank > 0:
@@ -433,6 +388,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 student_grad_norm = self._clip_grad_norm(self.transformer)
             student_optimizer.step()
             student_optimizer.zero_grad()
+            if self.accelerator.sync_gradients:
+                if self.ema_student is not None:
+                    self.ema_student.update()
             if fake_grad_stash is not None:
                 self._restore_optimizer_grads(fake_grad_stash)
             generated_latents = generated_latents.detach()
@@ -452,9 +410,12 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         fake_loss = fake_outputs["loss"]
         fake_named_losses = fake_outputs.get("named_losses") or {}
         named_losses.update(fake_named_losses)
-        self.accumulate_step_outputs({"loss": fake_loss, "named_losses": fake_named_losses})
+        self.record_loss_components({"loss": fake_loss, "named_losses": fake_named_losses})
 
-        self.accelerator.backward(fake_loss)
+        guidance_loss = fake_loss
+
+        self.accelerator.backward(guidance_loss)
+
         fake_grad_norm = None
         if self.accelerator.sync_gradients:
             fake_grad_norm = self._clip_grad_norm(fake_module)
@@ -463,20 +424,12 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         fake_optimizer.zero_grad()
         student_optimizer.zero_grad()
 
-        if self.ema_lora is not None and self.accelerator.sync_gradients:
-            self.ema_lora.update()
-
         wandb_extras = {}
         log_every = self.args.dmd_log_image_every
-        if (
-            log_every > 0
-            and self.accelerator.is_main_process
-            and self.vae is not None
-            and (self.global_step + 1) % log_every == 0
-        ):
+        if log_every > 0 and self.accelerator.is_main_process and self.vae is not None and (self.global_step + 1) % log_every == 0:
             wandb_extras = self._build_image_logs(
                 generated_latents=generated_latents.detach(),
-                dmd_log_latents=dmd_outputs["log_latents"] if do_gen_update else None,
+                dmd_log_latents=dmd_outputs["log_latents"] if (do_gen_update and dmd_outputs is not None) else None,
                 captions=batch.captions,
                 height=height,
                 width=width,
@@ -503,10 +456,18 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             "wandb_extras": wandb_extras,
         }
 
+    def load_checkpoint_state(self, full_path: str):
+        # student/fake weights are loaded in configure_transformer before the FSDP wrap, so
+        # the full-state load is skipped for the multi-module (student/, fake/) layout.
+        if os.path.isdir(os.path.join(full_path, "student")):
+            logger.info("DMD multi-module checkpoint; student/fake weights loaded in configure_transformer.")
+        else:
+            self.accelerator.load_state(full_path, map_location="cpu")
+
     def save_checkpoint(self):
         save_path = os.path.join(
             self.args.checkpoint_local_path,
-            f"checkpoint_{self.global_step - 1:06d}",
+            f"checkpoint_{self.global_step:06d}",
         )
         if getattr(self.accelerator.state, "fsdp_plugin", None) is not None:
             self.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
@@ -523,67 +484,38 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         state_dict = self.accelerator.get_state_dict(self.transformer, unwrap=False)
         if self.accelerator.is_main_process:
             for adapter_name in self.ADAPTER_NAMES:
-                save_peft_adapter(
-                    self.transformer_unwrapped,
-                    save_path,
-                    adapter_name,
-                    state_dict=state_dict,
-                )
+                save_peft_adapter(self.transformer_unwrapped, save_path, adapter_name, state_dict=state_dict)
             try:
-                import shutil
-                shutil.copyfile(
-                    self.args.json_data_input_path,
-                    os.path.join(save_path, "data_input.json"),
-                )
+                shutil.copyfile(self.args.json_data_input_path, os.path.join(save_path, "data_input.json"))
             except (OSError, FileNotFoundError):
                 pass
         del state_dict
-        if self.ema_lora is not None:
-            saved = self.ema_lora.swap_in()
-            try:
-                ema_state_dict = self.accelerator.get_state_dict(self.transformer, unwrap=False)
-            finally:
-                self.ema_lora.swap_out(saved)
-            if self.accelerator.is_main_process:
-                ema_dir = os.path.join(save_path, "ema")
-                for adapter_name in self.ADAPTER_NAMES:
-                    save_peft_adapter(
-                        self.transformer_unwrapped,
-                        ema_dir,
-                        adapter_name,
-                        state_dict=ema_state_dict,
-                    )
-            del ema_state_dict
+        if self.ema_student is not None:
+            self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped)
 
     def _save_full_ft_checkpoint(self, save_path: str):
-        """Save student and fake full-FT weights under student/ and fake/ subdirs.
-
-        Uses diffusers' ``save_pretrained`` with a gathered state_dict so the artefact
-        loads via ``from_pretrained`` for inference. Only rank 0 writes.
-        """
         logger.info(f"Saving full-FT DMD checkpoint to {save_path}")
         student_sd = self.accelerator.get_state_dict(self.transformer, unwrap=False)
         fake_sd = self.accelerator.get_state_dict(self.fake_transformer, unwrap=False)
         if self.accelerator.is_main_process:
-            self.transformer_unwrapped.save_pretrained(
-                os.path.join(save_path, "student"),
-                state_dict={k.replace("module.", "").replace("._orig_mod", ""): v for k, v in student_sd.items()},
-                is_main_process=True,
-            )
-            self.fake_transformer_unwrapped.save_pretrained(
-                os.path.join(save_path, "fake"),
-                state_dict={k.replace("module.", "").replace("._orig_mod", ""): v for k, v in fake_sd.items()},
-                is_main_process=True,
-            )
+            for sub, sd, unwrapped in (
+                ("student", student_sd, self.transformer_unwrapped),
+                ("fake", fake_sd, self.fake_transformer_unwrapped),
+            ):
+                sub_dir = os.path.join(save_path, sub)
+                os.makedirs(sub_dir, exist_ok=True)
+                unwrapped.save_config(sub_dir)
+                cleaned = {k.replace("module.", "").replace("._orig_mod", ""): v.contiguous() for k, v in sd.items()}
+                save_file(cleaned, os.path.join(sub_dir, "diffusion_pytorch_model.safetensors"))
+                del cleaned
             try:
-                import shutil
-                shutil.copyfile(
-                    self.args.json_data_input_path,
-                    os.path.join(save_path, "data_input.json"),
-                )
+                shutil.copyfile(self.args.json_data_input_path, os.path.join(save_path, "data_input.json"))
             except (OSError, FileNotFoundError):
                 pass
         del student_sd, fake_sd
+
+        if self.ema_student is not None:
+            self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped)
 
     @torch.no_grad()
     def _build_image_logs(
@@ -597,31 +529,57 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
     ) -> dict:
         """Rank-0-only VAE decode for wandb. VAE is local (not FSDP), so no collectives
         and no sync risk from other ranks skipping this path."""
-        n = min(4, generated_latents.shape[0])
+        n = min(8, generated_latents.shape[0])
         vae_dtype = next(self.vae.parameters()).dtype
 
         def _decode(packed):
-            return decode_to_images(
-                self.vae,
-                packed[:n].to(dtype=vae_dtype),
-                height,
-                width,
-                self.vae_scale_factor,
-                self.vae_config,
-                self.args.do_patching,
-            )
+            return decode_to_images(self.vae, packed[:n].to(dtype=vae_dtype), height, width, self.vae_scale_factor, self.vae_config, self.args.do_patching)
 
         def _to_wandb_list(t):
             arr = (t * 255).clamp(0, 255).to(torch.uint8).cpu().permute(0, 2, 3, 1).numpy()
-            return [
-                wandb.Image(
-                    arr[i],
-                    caption=get_caption_short_description(captions[min(i, len(captions) - 1)]),
-                )
-                for i in range(arr.shape[0])
-            ]
+            return [wandb.Image(arr[i], caption=get_caption_short_description(captions[min(i, len(captions) - 1)])) for i in range(arr.shape[0])]
 
         img_logs = {"dmd/generated": _to_wandb_list(_decode(generated_latents))}
         for key, latents in (dmd_log_latents or {}).items():
             img_logs[f"dmd/{key}"] = _to_wandb_list(_decode(latents))
         return img_logs
+
+    @torch.no_grad()
+    def generate_validation_latents(self, caption: str, height: int, width: int, device) -> torch.Tensor:
+        """Full DMD N-step student rollout for one caption from a fixed-seed noise tensor.
+
+        Implements the base-trainer validation hook. Returns packed x0 latents
+        ``(1, seq_len, C)``; mirrors the ``training_step`` rollout
+        but runs every step under no_grad — no grad step.
+        """
+        eh, te_layers, _, _ = self.run_text_encoder([caption])
+        eh = eh.to(device=device, dtype=torch.float32)
+
+        latent_h = height // self.vae_scale_factor
+        latent_w = width // self.vae_scale_factor
+        # Same fixed seed for every prompt and every pass -> comparable samples across steps.
+        gen = torch.Generator(device=device).manual_seed(self.args.validation_seed)
+        noise = torch.randn(1, self.vae_config["latent_channels"], latent_h, latent_w, device=device, dtype=torch.float32, generator=gen)
+        latents, img_ids = pack_t2i(noise, height, width, self.vae_scale_factor, self.args.do_patching, device)
+        latents_seq_len = latents.shape[1]
+
+        joint_attn_kwargs = {"attention_mask": None}
+        if self.args.lora_rank > 0:
+            joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer, device=device)
+
+        gen_kwargs = dict(
+            encoder_hidden_states=eh,
+            text_encoder_layers=te_layers,
+            img_ids=img_ids,
+            attn_kwargs=joint_attn_kwargs,
+            latents_seq_len=latents_seq_len,
+        )
+        infer_timesteps = build_infer_timesteps(self.infer_scheduler, self.args.dmd_num_inference_steps, latents_seq_len, device)
+        for t in infer_timesteps[:-1]:
+            pred = predict_flow_step(self.transformer, latents, t, **gen_kwargs)
+            latents = self.infer_scheduler.step(pred, t, latents, return_dict=False)[0]
+        t_final = infer_timesteps[-1]
+        pred = predict_flow_step(self.transformer, latents, t_final, **gen_kwargs)
+        sigma = (t_final.float() / 1000.0).to(device=device, dtype=latents.dtype)
+        latents = latents - sigma * pred
+        return latents

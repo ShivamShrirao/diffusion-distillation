@@ -5,10 +5,10 @@ Each builder returns:
 and mutates `args.train_batch_size` / `args.resolution` to representative values
 resolved from the data input.
 
-Resolution is always bucketed: every rank uses the same resolution on a given step,
-rotating through tar-count-weighted buckets so each step recompiles at most once per
-unique shape. The builders differ only in which keys they pull out of each record and
-what the collate produces — the scheduler / tar-loading / batching wiring is shared.
+Resolution is always bucketed: every rank uses the same batch token count on a given
+step, while ranks may choose different same-token-count resolutions. The builders
+differ only in which keys they pull out of each record and what the collate produces —
+the scheduler / tar-loading / batching wiring is shared.
 
 `--random_latents` swaps the real tar source for a synthetic single-bucket stream and
 reuses the same preprocess / collate, so no data reads happen.
@@ -78,7 +78,7 @@ def load_dataset_from_tars(
         tar_files,
         nodesplitter=wds.split_by_worker,
         handler=duplicate_name_handler,
-        shardshuffle=True,
+        shardshuffle=100,
     ).decode("torch")
 
 
@@ -99,6 +99,10 @@ class BucketSpec:
     batch_size: int
     tar_count: int
     token_count: int
+
+    @property
+    def batch_token_count(self) -> int:
+        return self.token_count * self.batch_size
 
 
 class DynamicResolutionScheduler:
@@ -125,7 +129,7 @@ class DynamicResolutionScheduler:
     def _build_groups(buckets: List[BucketSpec]) -> List[List[BucketSpec]]:
         groups: Dict[int, List[BucketSpec]] = {}
         for bucket in buckets:
-            groups.setdefault(bucket.token_count, []).append(bucket)
+            groups.setdefault(bucket.batch_token_count, []).append(bucket)
         return [groups[k] for k in sorted(groups.keys())]
 
     @staticmethod
@@ -157,10 +161,10 @@ class DynamicResolutionScheduler:
         rng.shuffle(schedule)
         return schedule
 
-    def _choose_bucket(self, group: List[BucketSpec], step: int) -> BucketSpec:
+    def _choose_bucket(self, group: List[BucketSpec], step: int, rank: int) -> BucketSpec:
         if len(group) == 1:
             return group[0]
-        rng = random.Random(self.seed + 1_000_003 * step)
+        rng = random.Random(self.seed + 1_000_003 * step + 9_176 * rank)
         total = sum(bucket.tar_count for bucket in group)
         pick = rng.randrange(total)
         running = 0
@@ -170,9 +174,9 @@ class DynamicResolutionScheduler:
                 return bucket
         return group[-1]
 
-    def bucket_for_step(self, step: int) -> BucketSpec:
+    def bucket_for_step(self, step: int, rank: int) -> BucketSpec:
         group_idx = self.group_schedule[step % len(self.group_schedule)]
-        return self._choose_bucket(self.groups[group_idx], step)
+        return self._choose_bucket(self.groups[group_idx], step, rank)
 
 
 class DynamicResolutionBatchIterator:
@@ -219,7 +223,7 @@ class DynamicResolutionBatchIterator:
                 self.iterators[key] = self._make_iterator(bucket)
 
     def __next__(self):
-        bucket = self.scheduler.bucket_for_step(self.step)
+        bucket = self.scheduler.bucket_for_step(self.step, self.rank)
         examples = [self._next_example(bucket) for _ in range(bucket.batch_size)]
         self.step += 1
         return self.collate_fn(examples, bucket)
@@ -231,16 +235,39 @@ def _latent_token_count(width: int, height: int, vae_scale_factor: int, do_patch
     return (height // vae_scale_factor) * (width // vae_scale_factor)
 
 
+def _sample_tar_files(tar_files: Tuple[str, ...], sample_percentage: float, seed: int, bucket_index: int) -> Tuple[str, ...]:
+    if sample_percentage >= 1.0:
+        return tar_files
+    if sample_percentage <= 0.0:
+        return ()
+    sample_count = max(1, int(len(tar_files) * sample_percentage))
+    rng = random.Random(seed + 1_000_003 * bucket_index)
+    return tuple(sorted(rng.sample(list(tar_files), sample_count)))
+
+
 def build_dynamic_scheduler(args, vae_config, logger):
     vae_scale_factor = vae_scale_factor_from_config(vae_config)
     entries: List[ResolutionData] = list_resolution_data(args.json_data_input_path)
     buckets = []
-    for entry in entries:
+    for entry_index, entry in enumerate(entries):
         tar_files = tuple(sorted(glob.glob(f"{entry.training_dir}/*.tar")))
-        tar_count = len(tar_files)
-        if tar_count <= 0:
+        total_tar_count = len(tar_files)
+        if total_tar_count <= 0:
             logger.warning(f"Skipping dynamic bucket {entry.width}x{entry.height}: no tars under {entry.training_dir}")
             continue
+        tar_files = _sample_tar_files(tar_files, entry.sample_percentage, args.seed, entry_index)
+        tar_count = len(tar_files)
+        if tar_count <= 0:
+            logger.warning(
+                f"Skipping dynamic bucket {entry.width}x{entry.height}: "
+                f"sample_percentage={entry.sample_percentage} selected no tars from {total_tar_count}"
+            )
+            continue
+        if tar_count != total_tar_count:
+            logger.info(
+                f"Using {tar_count}/{total_tar_count} tars for dynamic bucket "
+                f"{entry.width}x{entry.height} (sample_percentage={entry.sample_percentage})"
+            )
         buckets.append(
             BucketSpec(
                 index=len(buckets),
@@ -262,21 +289,18 @@ def build_dynamic_scheduler(args, vae_config, logger):
         seed=args.seed,
         schedule_steps=DYNAMIC_RESOLUTION_SCHEDULE_STEPS,
     )
-    group_desc = []
-    for group in scheduler.groups:
-        group_desc.append(
-            {
-                "tokens": group[0].token_count,
-                "resolutions": [f"{b.width}x{b.height}@bs{b.batch_size}" for b in group],
-                "tars": sum(b.tar_count for b in group),
-            }
-        )
+    group_lines = []
+    for i, group in enumerate(scheduler.groups):
+        resolutions = ", ".join(f"{b.width}x{b.height}@bs{b.batch_size}" for b in group)
+        tar_total = sum(b.tar_count for b in group)
+        group_lines.append(f"    [{i}] batch_tokens={group[0].batch_token_count}, tars={tar_total}: {resolutions}")
     logger.info(
-        "Dynamic resolution buckets: "
-        f"batch_sizes={sorted({b.batch_size for b in buckets})}, "
-        f"schedule_steps={scheduler.schedule_steps}, "
-        "all ranks use the same resolution per step, "
-        f"groups={group_desc}"
+        "Dynamic resolution buckets:\n"
+        f"  batch_sizes={sorted({b.batch_size for b in buckets})}\n"
+        f"  schedule_steps={scheduler.schedule_steps}\n"
+        f"  all ranks use the same batch token count per step\n"
+        f"  groups ({len(scheduler.groups)}):\n"
+        + "\n".join(group_lines)
     )
     return scheduler, buckets[0].batch_size
 

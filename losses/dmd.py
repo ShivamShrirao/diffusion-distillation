@@ -1,6 +1,6 @@
 """Decoupled DMD loss for flow-matching transformers.
 
-DMD/DMD2 formulation and work in x0 space:
+DMD/DMD2 formulation in x0 space:
 
     z_sigma = (1 - sigma) * x0 + sigma * eps
     v       = eps - x0
@@ -26,13 +26,13 @@ import torch.nn.functional as F
 from lora.static_multi_lora import StaticMultiLoraLinear, make_scales
 
 
-def add_flow_noise(x0: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-    sigmas = (timesteps.float() / 1000.0).view(-1, 1, 1).to(device=x0.device, dtype=x0.dtype)
+def add_flow_noise(x0: torch.Tensor, timesteps: torch.Tensor, noise_max_t: int) -> torch.Tensor:
+    sigmas = (timesteps.float() / noise_max_t).view(-1, 1, 1).to(device=x0.device, dtype=x0.dtype)
     return sigmas * torch.randn_like(x0) + (1.0 - sigmas) * x0
 
 
-def x0_from_v(noisy: torch.Tensor, pred_v: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-    sigmas = (timesteps.float() / 1000.0).view(-1, 1, 1).to(device=noisy.device, dtype=noisy.dtype)
+def x0_from_v(noisy: torch.Tensor, pred_v: torch.Tensor, timesteps: torch.Tensor, noise_max_t: int) -> torch.Tensor:
+    sigmas = (timesteps.float() / noise_max_t).view(-1, 1, 1).to(device=noisy.device, dtype=noisy.dtype)
     return noisy - sigmas * pred_v
 
 
@@ -47,7 +47,8 @@ def replicate_attn_mask(attn_kwargs: dict, n: int) -> dict:
 def compute_decoupled_dmd_loss(
     *,
     generated_latents: torch.Tensor,
-    generator_timesteps: torch.Tensor,
+    grad_step_idx: int,
+    mu: float,
     real_transformer,
     fake_transformer,
     cond_hidden_states: torch.Tensor,
@@ -61,22 +62,32 @@ def compute_decoupled_dmd_loss(
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
-    # LoRA mode binds all three roles (real/fake/student) to one transformer via
-    # ``lora_scales``. Full-FT passes distinct modules — detect that and skip the
-    # scales kwarg entirely (the pre-hook ignores absent keys, and full-FT modules
-    # have no StaticMultiLoraLinear so make_scales would raise).
     use_lora_scales = real_transformer is fake_transformer
     fake_scales = make_scales("fake", fake_transformer, device=device) if use_lora_scales else None
     disabled_scales = make_scales(None, real_transformer, device=device) if use_lora_scales else None
 
     with torch.no_grad():
-        # Per-sample uniform in [dmd_ca_min_step, generator_timestep).
-        ca_upper = generator_timesteps.long()
-        ca_timesteps = (torch.rand(ca_upper.shape, device=ca_upper.device) * (ca_upper - args.dmd_ca_min_step).float()).long() + args.dmd_ca_min_step
-        dm_timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
+        num_inference_steps = args.dmd_num_inference_steps
+        sigmas_pre = torch.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps, device=device)
+        sigma_pre_gen = sigmas_pre[grad_step_idx]
 
-        ca_noisy = add_flow_noise(generated_latents, ca_timesteps)
-        dm_noisy = add_flow_noise(generated_latents, dm_timesteps)
+        gen_sigma = torch.sigmoid(mu + torch.logit(sigma_pre_gen.clamp(min=1e-6, max=1.0 - 1e-6)))
+        ca_upper = (gen_sigma * args.noise_max_t).long()
+
+        # --- CA renoise timestep (uncomment one) ---
+        # uniform unit sigma, bounded by generator_t:
+        ca_timesteps = (torch.rand(batch_size, device=device) * ca_upper.float()).long()
+        # clean-bias (sigma=U**1.5), bounded by generator_t:
+        # ca_timesteps = ((torch.rand(batch_size, device=device) ** 1.5) * ca_upper.float()).long()
+
+        # --- DM renoise timestep (uncomment one) ---
+        # uniform:
+        dm_timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
+        # clean-bias (sigma=U**1.5):
+        # dm_timesteps = ((torch.rand(batch_size, device=device) ** 1.5) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
+
+        ca_noisy = add_flow_noise(generated_latents, ca_timesteps, args.noise_max_t)
+        dm_noisy = add_flow_noise(generated_latents, dm_timesteps, args.noise_max_t)
 
         cond_h = cond_hidden_states.to(dtype=model_dtype)
         uncond_h = uncond_hidden_states.to(dtype=model_dtype)
@@ -116,10 +127,10 @@ def compute_decoupled_dmd_loss(
             joint_attention_kwargs=fake_attn_kwargs,
         )
 
-        real_ca_cond_x0 = x0_from_v(ca_noisy, real_ca_cond_v, ca_timesteps)
-        real_ca_uncond_x0 = x0_from_v(ca_noisy, real_ca_uncond_v, ca_timesteps)
-        real_dm_cond_x0 = x0_from_v(dm_noisy, real_dm_cond_v, dm_timesteps)
-        fake_dm_cond_x0 = x0_from_v(dm_noisy, fake_dm_cond_v, dm_timesteps)
+        real_ca_cond_x0 = x0_from_v(ca_noisy, real_ca_cond_v, ca_timesteps, args.noise_max_t)
+        real_ca_uncond_x0 = x0_from_v(ca_noisy, real_ca_uncond_v, ca_timesteps, args.noise_max_t)
+        real_dm_cond_x0 = x0_from_v(dm_noisy, real_dm_cond_v, dm_timesteps, args.noise_max_t)
+        fake_dm_cond_x0 = x0_from_v(dm_noisy, fake_dm_cond_v, dm_timesteps, args.noise_max_t)
 
         ca_update = (args.dmd_real_guidance_scale - 1.0) * (real_ca_cond_x0 - real_ca_uncond_x0)
         ca_norm = (real_ca_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
@@ -171,16 +182,16 @@ def compute_fake_score_loss(
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
-    # Full-FT: ``transformer`` is the dedicated fake module with no StaticMultiLoraLinear,
-    # so skip the scales lookup. LoRA mode: ``transformer`` carries both adapters and the
-    # "fake" scales pick the right one.
     use_lora_scales = any(isinstance(sub, StaticMultiLoraLinear) for sub in transformer.modules())
     fake_scales = make_scales("fake", transformer, device=device) if use_lora_scales else None
 
-    timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.long)
+    # --- fake-score renoise timestep (uncomment one) ---
+    # uniform:
+    timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
+    # clean-bias: timesteps = ((torch.rand(batch_size, device=device) ** 1.5) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
     clean_latents = generated_latents.detach()
     noise = torch.randn_like(clean_latents)
-    sigmas = (timesteps.float() / 1000.0).view(-1, 1, 1).to(device=device, dtype=clean_latents.dtype)
+    sigmas = (timesteps.float() / args.noise_max_t).view(-1, 1, 1).to(device=device, dtype=clean_latents.dtype)
     noisy_latents = sigmas * noise + (1.0 - sigmas) * clean_latents
     target_v = noise - clean_latents
 

@@ -194,8 +194,8 @@ class BaseTrainer:
     def setup(self):
         self.args = self.parse_args()
         self.rank = int(os.environ.get("RANK", 0))
-        self.seed = set_seed_for_rank(self.args.seed)
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        self.seed = set_seed_for_rank(self.args.seed)
         self.weight_dtype = resolve_dtype(self.args.mixed_precision)
 
         self.accelerator = build_accelerator(self.args, self.weight_dtype)
@@ -276,6 +276,8 @@ class BaseTrainer:
         logger.info("***** Running training *****")
         logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {self.args.max_train_steps}")
+        gpus_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        logger.info(f"  World size = {self.accelerator.num_processes} ({self.accelerator.num_processes // gpus_per_node} nodes × {gpus_per_node} GPUs)")
 
         self.global_step = self.args.global_step
         if self.args.resume_from_checkpoint != "no":
@@ -704,7 +706,7 @@ class BaseTrainer:
         wandb_images = []
         for idx in sorted(by_idx):
             arr = (by_idx[idx] * 255).clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
-            wandb_images.append(wandb.Image(arr, caption=get_caption_short_description(self.val_prompts[idx])))
+            wandb_images.append(wandb.Image(arr, caption=get_caption_short_description(self.val_prompts[idx]), file_type="jpg"))
         wandb.log({log_key: wandb_images}, step=self.global_step)
 
     # ---------------------------------------------------------------

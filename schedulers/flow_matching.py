@@ -25,16 +25,31 @@ def build_infer_scheduler() -> FlowMatchEulerDiscreteScheduler:
     return FlowMatchEulerDiscreteScheduler.from_config(_DEFAULT_INFER_SCHEDULER_CONFIG)
 
 
-def build_infer_timesteps(infer_scheduler, current_num_inference_steps: int, latents_seq_len: int, device):
-    """Compute the per-step timesteps for one inference pass."""
-    sigmas = np.linspace(1.0, 1 / current_num_inference_steps, current_num_inference_steps)
-    mu = calculate_shift(
-        latents_seq_len,
-        infer_scheduler.config.base_image_seq_len,
-        infer_scheduler.config.max_image_seq_len,
-        infer_scheduler.config.base_shift,
-        infer_scheduler.config.max_shift,
+def resolve_mu(infer_scheduler, latents_seq_len: int, mu: float | None = None) -> float:
+    """Flow-matching time-shift mu: the explicit value if given, else the resolution-dependent
+    shift from `calculate_shift` using the scheduler's base/max image-seq-len and shift config."""
+    if mu is not None:
+        return mu
+    cfg = infer_scheduler.config
+    return calculate_shift(
+        latents_seq_len, cfg.base_image_seq_len, cfg.max_image_seq_len, cfg.base_shift, cfg.max_shift
     )
+
+
+def build_infer_timesteps(
+    infer_scheduler,
+    current_num_inference_steps: int,
+    latents_seq_len: int,
+    device,
+    mu: float | None = None,
+):
+    """Compute the per-step timesteps for one inference pass.
+
+    Pass `mu` to override the resolution-dependent shift; otherwise it is
+    interpolated from `latents_seq_len` via `calculate_shift`.
+    """
+    sigmas = np.linspace(1.0, 1 / current_num_inference_steps, current_num_inference_steps)
+    mu = resolve_mu(infer_scheduler, latents_seq_len, mu)
     timesteps, _ = retrieve_timesteps(
         infer_scheduler,
         num_inference_steps=current_num_inference_steps,

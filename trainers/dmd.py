@@ -7,7 +7,7 @@ import os
 import torch
 import shutil
 import wandb
-from accelerate.utils import broadcast
+from accelerate.utils import broadcast, gather_object
 from diffusers.training_utils import cast_training_params
 from safetensors.torch import load_file, save_file
 
@@ -33,74 +33,17 @@ from losses.dmd import compute_decoupled_dmd_loss, compute_fake_score_loss
 from models.text_encoder import create_attention_matrix
 from models.transformer import Fibo2Transformer2DModel, build_transformer_config
 from models.vae import build_vae, decode_to_images
-from schedulers.flow_matching import build_infer_scheduler, build_infer_timesteps
+from schedulers.flow_matching import build_infer_scheduler, build_infer_timesteps, resolve_mu
 from schedulers.inference import predict_flow_step
 from trainers.base import BaseTrainer, logger
 
 
-def maybe_resume_dmd_adapters(transformer, adapter_names, args):
-    """Load student + fake adapter weights from a PEFT-format checkpoint
-    directory (one safetensors per adapter).
-
-    Resume path takes precedence (continues an interrupted run with full state).
-    Falls back to ``--lora_init`` for cold-init from a saved DMD ckpt
-    when starting a fresh run.
-    """
-    ckpt_path = resolve_resume_checkpoint(args)
-    if ckpt_path is None:
-        ckpt_path = args.lora_init
-        if ckpt_path:
-            logger.info(f"Cold-initializing DMD adapters from lora_init={ckpt_path}")
-    if not ckpt_path or not os.path.isdir(os.path.join(ckpt_path, adapter_names[0])):
-        return
-    for adapter_name in adapter_names:
-        logger.info(f"Loading DMD adapter '{adapter_name}' from {ckpt_path}")
-        load_peft_adapter(transformer, ckpt_path, adapter_name)
-
-
-def _load_full_ft_weights(ckpt_dir: str) -> dict:
-    """Load a diffusers ``save_pretrained``-style weights dir into a state_dict.
-
-    Tries diffusers' default safetensors name first, falls back to other common
-    names that ``load_transformer_init_weights`` also accepts.
-    """
-    for fname in ("diffusion_pytorch_model.safetensors", "model.safetensors", "pytorch_model.bin"):
-        path = os.path.join(ckpt_dir, fname)
-        if os.path.exists(path):
-            return load_file(path) if path.endswith(".safetensors") else torch.load(path, map_location="cpu", mmap=True)
-    raise FileNotFoundError(
-        f"No transformer weights found in {ckpt_dir} (looked for diffusion_pytorch_model.safetensors / model.safetensors / pytorch_model.bin)"
-    )
-
-
-def maybe_resume_dmd_full_ft(student_transformer, fake_transformer, args):
-    """Load student + fake full-FT weights from a checkpoint dir laid out as
-    ``ckpt/student/`` and ``ckpt/fake/`` (the layout written by
-    ``DecoupledDMDT2ITrainer._save_full_ft_checkpoint``).
-
-    Returns True if weights were loaded, False otherwise. Falls back to
-    ``--lora_init`` (reused as the generic DMD cold-init path — layout
-    is disambiguated by ``args.lora_rank``).
-    """
-    ckpt_path = resolve_resume_checkpoint(args)
-    cold_init = ckpt_path is None
-    if cold_init:
-        # Reuse lora_init as the generic "cold-init from a saved DMD ckpt" path —
-        # the trainer's mode (lora_rank) already disambiguates the layout.
-        ckpt_path = args.lora_init
-        if ckpt_path:
-            logger.info(f"Cold-initializing DMD full-FT student+fake from lora_init={ckpt_path}")
-    if not ckpt_path or not os.path.isdir(os.path.join(ckpt_path, "student")) or not os.path.isdir(os.path.join(ckpt_path, "fake")):
-        return False
-    logger.info(f"Loading DMD full-FT student weights from {os.path.join(ckpt_path, 'student')}")
-    student_sd = _load_full_ft_weights(os.path.join(ckpt_path, "student"))
-    student_transformer.load_state_dict(student_sd, assign=True)
-    del student_sd
-    logger.info(f"Loading DMD full-FT fake weights from {os.path.join(ckpt_path, 'fake')}")
-    fake_sd = _load_full_ft_weights(os.path.join(ckpt_path, "fake"))
-    fake_transformer.load_state_dict(fake_sd, assign=True)
-    del fake_sd
-    return True
+def dmd_init_path(args, channel):
+    """``{student,fake}`` subdir of resume ckpt, else ``--{channel}_init``."""
+    resume = resolve_resume_checkpoint(args)
+    if resume:
+        return os.path.join(resume, channel)
+    return getattr(args, f"{channel}_init", None)
 
 
 class DecoupledDMDT2ITrainer(BaseTrainer):
@@ -144,7 +87,11 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             dropout=0.0,
         )
         logger.info(f"Injected StaticMultiLoraLinear on {len(replaced)} modules")
-        maybe_resume_dmd_adapters(self.transformer, self.ADAPTER_NAMES, args)
+        for adapter in self.ADAPTER_NAMES:
+            p = dmd_init_path(args, adapter)
+            if p and os.path.isdir(p):
+                load_peft_adapter(self.transformer, p, adapter, in_subdir="")
+                logger.info(f"Loaded LoRA '{adapter}' from {p}")
         for name, param in self.transformer.named_parameters():
             param.requires_grad_("lora_" in name)
         cast_training_params([self.transformer], dtype=torch.float32)
@@ -167,19 +114,24 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.fake_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
             self.real_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
 
-        is_rank0 = self.accelerator.is_main_process
-        if (args.use_fsdp and is_rank0) or (not args.use_fsdp):
+        if (args.use_fsdp and self.accelerator.is_main_process) or (not args.use_fsdp):
             src_sd = self.transformer.state_dict()
             self.real_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
             self.fake_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
             del src_sd
-            maybe_resume_dmd_full_ft(self.transformer, self.fake_transformer, args)
+            for t, adapter in ((self.transformer, "student"), (self.fake_transformer, "fake")):
+                p = dmd_init_path(args, adapter)
+                fp = os.path.join(p, "diffusion_pytorch_model.safetensors") if p else None
+                if fp and os.path.exists(fp):
+                    t.load_state_dict(load_file(fp), assign=True)
+                    logger.info(f"Loaded full-FT '{adapter}' from {fp}")
 
         self.fake_transformer.requires_grad_(True)
         self.real_transformer.requires_grad_(False)
 
         if args.gradient_checkpointing:
             self.fake_transformer.enable_gradient_checkpointing()
+            self.real_transformer.enable_gradient_checkpointing()
 
         self.fake_transformer_unwrapped = self.fake_transformer
         self.real_transformer_unwrapped = self.real_transformer
@@ -207,6 +159,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 elif "fake" in name:
                     fake_params.append(param)
 
+        fake_lr = self.args.fake_lr if self.args.fake_lr is not None else self.args.learning_rate
         student_optimizer = torch.optim.AdamW(
             student_params,
             lr=self.args.learning_rate,
@@ -217,7 +170,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         )
         fake_optimizer = torch.optim.AdamW(
             fake_params,
-            lr=self.args.learning_rate,
+            lr=fake_lr,
             betas=(self.args.adam_beta1, self.args.adam_beta2),
             weight_decay=self.args.adam_weight_decay,
             eps=self.args.adam_epsilon,
@@ -293,7 +246,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer, device=device)
 
         num_inference_steps = self.args.dmd_num_inference_steps
-        infer_timesteps = build_infer_timesteps(self.infer_scheduler, num_inference_steps, latents_seq_len, device)
+        infer_timesteps = build_infer_timesteps(self.infer_scheduler, num_inference_steps, latents_seq_len, device, mu=self.args.dmd_mu)
 
         generated_latents = torch.randn(patched_latents.shape, device=device, dtype=patched_latents.dtype, generator=self.generator)
 
@@ -325,13 +278,13 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 pred = predict_flow_step(self.transformer, generated_latents, t_grad, **gen_kwargs)
             sigma = (t_grad.float() / 1000.0).to(device=device, dtype=generated_latents.dtype)
             generated_latents = generated_latents - sigma * pred
-            generator_timesteps = t_grad.long().expand(generated_latents.shape[0]).to(device=device)
+            dmd_latents = generated_latents
 
         return {
             "image": [height, width, device],
             "cond": [eh, te_layers, patched_image_ids, joint_attn_kwargs],
             "null": [current_null_embeds, current_null_layers],
-            "rollout": [generated_latents, generator_timesteps, do_gen_update, grad_step_idx],
+            "rollout": [dmd_latents, do_gen_update, grad_step_idx],
             "real_latents": patched_latents,
             "timings": [text_encoder_time, generate_time[0], mask_time[0], fetch_time_sec],
         }
@@ -341,7 +294,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         height, width, device = setup["image"]
         eh, te_layers, patched_image_ids, joint_attn_kwargs = setup["cond"]
         current_null_embeds, current_null_layers = setup["null"]
-        generated_latents, generator_timesteps, do_gen_update, grad_step_idx = setup["rollout"]
+        dmd_latents, do_gen_update, grad_step_idx = setup["rollout"]
         text_encoder_time, generate_time, mask_time, fetch_time_sec = setup["timings"]
         student_optimizer, fake_optimizer = self.optimizer[0], self.optimizer[1]
         student_lr_scheduler, fake_lr_scheduler = self.lr_scheduler[0], self.lr_scheduler[1]
@@ -351,15 +304,15 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         dmd_loss = torch.tensor(0.0, device=device)
         student_grad_norm = None
 
-        # In LoRA mode, real == fake == self.transformer (different lora_scales select the
-        # role). In full-FT, the three roles are three distinct modules.
         real_module = self.transformer if self.args.lora_rank > 0 else self.real_transformer
         fake_module = self.transformer if self.args.lora_rank > 0 else self.fake_transformer
-
+        # 1) Student update — DMD loss (internal fake DM fwd + real teacher fwd).
         if do_gen_update:
+            mu = resolve_mu(self.infer_scheduler, dmd_latents.shape[1], self.args.dmd_mu)
             dmd_outputs = compute_decoupled_dmd_loss(
-                generated_latents=generated_latents,
-                generator_timesteps=generator_timesteps,
+                generated_latents=dmd_latents,
+                grad_step_idx=grad_step_idx,
+                mu=mu,
                 real_transformer=real_module,
                 fake_transformer=fake_module,
                 cond_hidden_states=eh,
@@ -382,24 +335,22 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             fake_grad_stash = None
             if self.accelerator.sync_gradients:
                 if self.args.lora_rank > 0:
-                    # LoRA: student+fake share self.transformer; stash fake grads so the
-                    # full-model clip only normalizes student grads, restored after step.
                     fake_grad_stash = self._stash_optimizer_grads(fake_optimizer)
                 student_grad_norm = self._clip_grad_norm(self.transformer)
             student_optimizer.step()
             student_optimizer.zero_grad()
-            if self.accelerator.sync_gradients:
-                if self.ema_student is not None:
-                    self.ema_student.update()
+            if self.accelerator.sync_gradients and self.ema_student is not None:
+                self.ema_student.update()
             if fake_grad_stash is not None:
                 self._restore_optimizer_grads(fake_grad_stash)
-            generated_latents = generated_latents.detach()
+            dmd_latents = dmd_latents.detach()
 
         student_lr_scheduler.step()
 
+        # 2) Fake score forward (separate, full fake backbone on detached student latents).
         fake_outputs = compute_fake_score_loss(
             transformer=fake_module,
-            generated_latents=generated_latents,
+            generated_latents=dmd_latents,
             cond_hidden_states=eh,
             cond_layers=te_layers,
             img_ids=patched_image_ids,
@@ -426,9 +377,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         wandb_extras = {}
         log_every = self.args.dmd_log_image_every
-        if log_every > 0 and self.accelerator.is_main_process and self.vae is not None and (self.global_step + 1) % log_every == 0:
+        if log_every > 0 and self.vae is not None and (self.global_step + 1) % log_every == 0:
             wandb_extras = self._build_image_logs(
-                generated_latents=generated_latents.detach(),
+                generated_latents=dmd_latents.detach(),
                 dmd_log_latents=dmd_outputs["log_latents"] if (do_gen_update and dmd_outputs is not None) else None,
                 captions=batch.captions,
                 height=height,
@@ -527,21 +478,63 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         height: int,
         width: int,
     ) -> dict:
-        """Rank-0-only VAE decode for wandb. VAE is local (not FSDP), so no collectives
-        and no sync risk from other ranks skipping this path."""
-        n = min(8, generated_latents.shape[0])
+        """Gather packed latents + per-rank (H, W) and decode on rank 0.
+
+        Dynamic-resolution buckets let ranks pick different aspect ratios at the same step;
+        seq_len is identical across ranks (token count is the bucket key), but the unpacked
+        (H, W) differs. We gather the packed latents (same shape) and per-sample (H, W),
+        then rank 0 unpacks each with its own resolution. ALL ranks must reach this call.
+        """
+        world = self.accelerator.num_processes
+        is_main = self.accelerator.is_main_process
+        target = min(8, generated_latents.shape[0] * world)
+        per_rank = (target + world - 1) // world
         vae_dtype = next(self.vae.parameters()).dtype
 
-        def _decode(packed):
-            return decode_to_images(self.vae, packed[:n].to(dtype=vae_dtype), height, width, self.vae_scale_factor, self.vae_config, self.args.do_patching)
+        def take_local(packed):
+            local = packed[:per_rank]
+            if local.shape[0] < per_rank:
+                pad = local[-1:].expand(per_rank - local.shape[0], *local.shape[1:])
+                local = torch.cat([local, pad], dim=0)
+            return local.to(dtype=vae_dtype)
 
-        def _to_wandb_list(t):
-            arr = (t * 255).clamp(0, 255).to(torch.uint8).cpu().permute(0, 2, 3, 1).numpy()
-            return [wandb.Image(arr[i], caption=get_caption_short_description(captions[min(i, len(captions) - 1)])) for i in range(arr.shape[0])]
+        def gather_packed(packed):
+            return self.accelerator.gather(take_local(packed))[:target]
 
-        img_logs = {"dmd/generated": _to_wandb_list(_decode(generated_latents))}
+        local_caps = list(captions[:per_rank])
+        while len(local_caps) < per_rank:
+            local_caps.append(local_caps[-1] if local_caps else "")
+        gathered_caps = gather_object(local_caps)[:target]
+        gathered_hw = gather_object([(height, width)] * per_rank)[:target]
+
+        def decode_per_sample(packed_all):
+            if not is_main:
+                return None
+            imgs = []
+            for i in range(packed_all.shape[0]):
+                h_i, w_i = gathered_hw[i]
+                img = decode_to_images(
+                    self.vae, packed_all[i : i + 1], h_i, w_i,
+                    self.vae_scale_factor, self.vae_config, self.args.do_patching,
+                )
+                imgs.append(img[0])
+            return imgs
+
+        def to_wandb_list(imgs):
+            out = []
+            for i, t in enumerate(imgs):
+                arr = (t * 255).clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
+                out.append(wandb.Image(arr, caption=get_caption_short_description(gathered_caps[i]), file_type="jpg"))
+            return out
+
+        img_logs = {}
+        gen_imgs = decode_per_sample(gather_packed(generated_latents))
+        if is_main:
+            img_logs["dmd/generated"] = to_wandb_list(gen_imgs)
         for key, latents in (dmd_log_latents or {}).items():
-            img_logs[f"dmd/{key}"] = _to_wandb_list(_decode(latents))
+            dec = decode_per_sample(gather_packed(latents))
+            if is_main:
+                img_logs[f"dmd/{key}"] = to_wandb_list(dec)
         return img_logs
 
     @torch.no_grad()
@@ -552,8 +545,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         ``(1, seq_len, C)``; mirrors the ``training_step`` rollout
         but runs every step under no_grad — no grad step.
         """
-        eh, te_layers, _, _ = self.run_text_encoder([caption])
+        eh, te_layers, prompt_attn_mask, _ = self.run_text_encoder([caption])
         eh = eh.to(device=device, dtype=torch.float32)
+        prompt_attn_mask = prompt_attn_mask.to(device=device, dtype=torch.float32)
 
         latent_h = height // self.vae_scale_factor
         latent_w = width // self.vae_scale_factor
@@ -563,7 +557,10 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         latents, img_ids = pack_t2i(noise, height, width, self.vae_scale_factor, self.args.do_patching, device)
         latents_seq_len = latents.shape[1]
 
-        joint_attn_kwargs = {"attention_mask": None}
+        latent_attn = torch.ones([1, latents_seq_len], dtype=latents.dtype, device=device)
+        attn_mask = torch.cat([prompt_attn_mask, latent_attn], dim=1)
+        attn_mask = create_attention_matrix(attn_mask).unsqueeze(dim=1).to(self.weight_dtype)
+        joint_attn_kwargs = {"attention_mask": attn_mask}
         if self.args.lora_rank > 0:
             joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer, device=device)
 
@@ -574,7 +571,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             attn_kwargs=joint_attn_kwargs,
             latents_seq_len=latents_seq_len,
         )
-        infer_timesteps = build_infer_timesteps(self.infer_scheduler, self.args.dmd_num_inference_steps, latents_seq_len, device)
+        infer_timesteps = build_infer_timesteps(self.infer_scheduler, self.args.dmd_num_inference_steps, latents_seq_len, device, mu=self.args.dmd_mu)
         for t in infer_timesteps[:-1]:
             pred = predict_flow_step(self.transformer, latents, t, **gen_kwargs)
             latents = self.infer_scheduler.step(pred, t, latents, return_dict=False)[0]

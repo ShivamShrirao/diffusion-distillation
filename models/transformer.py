@@ -113,6 +113,8 @@ def load_transformer_init_weights(transformer, transformer_init: str, logger):
         ckpt_path = f"{transformer_init}/pytorch_model.bin"
     elif os.path.exists(f"{transformer_init}/pytorch_model_fsdp.bin"):
         ckpt_path = f"{transformer_init}/pytorch_model_fsdp.bin"
+    elif os.path.exists(f"{transformer_init}/transformer_ema.bin"):
+        ckpt_path = f"{transformer_init}/transformer_ema.bin"
     elif os.path.exists(f"{transformer_init}/model.safetensors"):
         ckpt_path = f"{transformer_init}/model.safetensors"
     else:

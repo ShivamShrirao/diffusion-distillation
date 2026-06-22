@@ -9,6 +9,7 @@ class ResolutionData:
     width: int
     height: int
     batch_size: int
+    sample_percentage: float = 1.0
 
 
 def dataset_active(value: dict) -> bool:
@@ -31,7 +32,17 @@ def list_resolution_data(json_file: str) -> List[ResolutionData]:
         if not dataset_active(value):
             continue
         base_dir = value["path"].rstrip("/")
-        for res in value["resolutions_wh"]:
+        resolutions = value["resolutions_wh"]
+        sample_percentages = value.get("sample_percentages", [1.0] * len(resolutions))
+        if len(sample_percentages) != len(resolutions):
+            raise ValueError(
+                f"{key} sample_percentages must have one value per resolution "
+                f"({len(sample_percentages)} != {len(resolutions)})"
+            )
+        for res, sample_percentage in zip(resolutions, sample_percentages):
+            sample_percentage = float(sample_percentage)
+            if not 0.0 <= sample_percentage <= 1.0:
+                raise ValueError(f"{key} sample percentage for {res} must be in [0, 1], got {sample_percentage}")
             width_str, height_str = res.split(",")
             width = int(width_str)
             height = int(height_str)
@@ -41,6 +52,7 @@ def list_resolution_data(json_file: str) -> List[ResolutionData]:
                     width=width,
                     height=height,
                     batch_size=value["batch_size"],
+                    sample_percentage=sample_percentage,
                 )
             )
     return out

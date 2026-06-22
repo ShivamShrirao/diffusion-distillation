@@ -3,9 +3,9 @@ import os
 import random
 from datetime import datetime, timezone
 
+import numpy as np
 import torch
 from accelerate.logging import get_logger as _accel_get_logger
-from accelerate.utils import set_seed as _accelerate_set_seed
 
 
 def setup_root_logger():
@@ -23,8 +23,11 @@ def get_logger(name: str = __name__):
 def set_seed_for_rank(base_seed: int) -> int:
     rank = int(os.environ.get("RANK", 0))
     seed = base_seed + rank
-    _accelerate_set_seed(seed)
     random.seed(seed)
+    np.random.seed(seed)
+    torch.random.default_generator.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
     return seed
 
 
@@ -72,11 +75,18 @@ def init_wandb(accelerator, args, project_name: str = "image-model", extend_name
         name = args.wandb_name
     name += "_" + datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M")
 
-    wandb.init(
+    init_kwargs = dict(
         project=project_name,
         config=conf,
         mode="online" if project_name else "disabled",
         name=name,
     )
+    resume_id = getattr(args, "wandb_resume_from", "") or None
+    if resume_id:
+        os.environ["WANDB_RUN_ID"] = resume_id
+        init_kwargs["id"] = resume_id
+        init_kwargs["resume"] = "must"
+
+    wandb.init(**init_kwargs)
     accelerator.init_trackers(project_name or "distillation")
     wandb.config.update(vars(args), allow_val_change=True)

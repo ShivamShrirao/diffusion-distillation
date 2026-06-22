@@ -32,10 +32,16 @@ def add_base_args(parser):
         help="Fibo 2.0 diffusers repo (transformer, text_encoder, processor, vae).",
     )
     parser.add_argument(
-        "--lora_init",
+        "--student_init",
         type=str,
         default=None,
-        help="Optional DMD checkpoint dir to cold-start the student and fake adapters from.",
+        help="Optional DMD checkpoint `student/` dir to cold-start the student from.",
+    )
+    parser.add_argument(
+        "--fake_init",
+        type=str,
+        default=None,
+        help="Optional DMD checkpoint `fake/` dir to cold-start the fake critic from.",
     )
     parser.add_argument(
         "--transformer_init",
@@ -82,6 +88,12 @@ def add_base_args(parser):
     parser.add_argument("--lora_alpha", type=int, default=-1, help="LoRA alpha. -1 means use 2 * lora_rank (legacy default).")
     parser.add_argument("--wandb_name", type=str, default="run")
     parser.add_argument("--wandb_project", type=str, default="", help="wandb project; empty = no wandb.")
+    parser.add_argument(
+        "--wandb_resume_from",
+        type=str,
+        default="",
+        help="Resume (append) into an existing wandb run id. Empty = fresh run.",
+    )
     parser.add_argument("--do_patching", type=int, default=1)
     parser.add_argument("--full_torch_compile", type=int, default=0)
     parser.add_argument("--regional_compile", type=int, default=0)

@@ -3,6 +3,12 @@
 
 def add_decoupled_dmd_args(parser):
     parser.add_argument(
+        "--noise_max_t",
+        type=int,
+        default=1000,
+        help="Max timestep for flow-matching noise (sigma = t / noise_max_t). Used by the DMD DM-update / fake-score noise (capped at this value), and the add_flow_noise / x0_from_v conversions. Default 1000 matches the standard convention.",
+    )
+    parser.add_argument(
         "--dmd_loss_scale",
         type=float,
         default=1.0,
@@ -13,6 +19,12 @@ def add_decoupled_dmd_args(parser):
         type=int,
         default=4,
         help="Number of student generation steps per training iteration.",
+    )
+    parser.add_argument(
+        "--dmd_mu",
+        type=float,
+        default=None,
+        help="Flow-matching time shift mu for the student schedule (sigma' = e^mu * sigma / (1 + (e^mu - 1) * sigma)). None = resolution-dependent calculate_shift (default; ~1.15 at 1024). Lower mu biases intermediate timesteps toward cleaner sigmas.",
     )
     parser.add_argument(
         "--dmd_fake_loss_scale",
@@ -31,12 +43,6 @@ def add_decoupled_dmd_args(parser):
         type=float,
         default=1.0,
         help="Weight for classifier-alignment component.",
-    )
-    parser.add_argument(
-        "--dmd_ca_min_step",
-        type=int,
-        default=20,
-        help="Minimum timestep sampled for the classifier-alignment component.",
     )
     parser.add_argument(
         "--dmd_dm_weight",
@@ -61,4 +67,10 @@ def add_decoupled_dmd_args(parser):
         type=float,
         default=0.0,
         help="EMA decay for the student/fake LoRA shadow. Saved as a side ema/ subdir per checkpoint. 0 disables.",
+    )
+    parser.add_argument(
+        "--fake_lr",
+        type=float,
+        default=None,
+        help="Learning rate for the fake/guidance optimizer. Defaults to --learning_rate.",
     )

@@ -186,6 +186,7 @@ class DynamicResolutionBatchIterator:
         self.seed = seed
         self.preprocess_fn = preprocess_fn
         self.collate_fn = collate_fn
+        self.start_step = start_step
         self.step = start_step
         self.iterators = {}
         self.epochs = {}
@@ -199,7 +200,7 @@ class DynamicResolutionBatchIterator:
     def _make_iterator(self, bucket: BucketSpec):
         key = self._iterator_key(bucket)
         epoch = self.epochs.get(key, 0)
-        current_seed = self.seed + 10_007 * bucket.index + epoch
+        current_seed = (self.seed + 1_000_003 * self.start_step + 10_007 * bucket.index + epoch) % (2**32)
         ds = load_dataset_from_tars(
             training_dirs=[bucket.training_dir],
             rank=self.rank,
@@ -339,8 +340,9 @@ def build_dynamic_dataloader(args, vae_config, logger, preprocess, collate) -> T
     total_batch = WORLD_SIZE * batch_size
     print(f"Rank {rank}: dynamic resolution buckets, batch size {batch_size}, total batch {total_batch}")
 
-    def get_dataloader():
-        start_step = int(getattr(args, "global_step", 0)) * int(getattr(args, "gradient_accumulation_steps", 1))
+    def get_dataloader(start_step: int | None = None):
+        if start_step is None:
+            start_step = int(getattr(args, "global_step", 0)) * int(getattr(args, "gradient_accumulation_steps", 1))
         return DynamicResolutionBatchIterator(
             scheduler=scheduler,
             rank=rank,
@@ -371,7 +373,7 @@ def build_random_dataloader(args, build_sample, preprocess, collate, logger) -> 
     total_batch = WORLD_SIZE * bucket.batch_size
     print(f"Rank {int(os.environ.get('RANK', 0))}: random latents, batch size {bucket.batch_size} for resolution {width}x{height}")
 
-    def get_dataloader():
+    def get_dataloader(start_step: int | None = None):
         return SyntheticBatchIterator(bucket, build_sample, preprocess, collate)
 
     return get_dataloader, total_batch

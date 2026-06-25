@@ -49,6 +49,9 @@ def compute_decoupled_dmd_loss(
     generated_latents: torch.Tensor,
     grad_step_idx: int,
     mu: float,
+    num_inference_steps: int | None = None,
+    seg_lo: float | None = None,
+    seg_hi: float | None = None,
     real_transformer,
     fake_transformer,
     cond_hidden_states: torch.Tensor,
@@ -67,7 +70,8 @@ def compute_decoupled_dmd_loss(
     disabled_scales = make_scales(None, real_transformer, device=device) if use_lora_scales else None
 
     with torch.no_grad():
-        num_inference_steps = args.dmd_num_inference_steps
+        # TDM steps-aware: use the active K for this iteration (falls back to the fixed arg).
+        num_inference_steps = num_inference_steps if num_inference_steps is not None else args.dmd_num_inference_steps
         sigmas_pre = torch.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps, device=device)
         sigma_pre_gen = sigmas_pre[grad_step_idx]
 
@@ -75,16 +79,18 @@ def compute_decoupled_dmd_loss(
         ca_upper = (gen_sigma * args.noise_max_t).long()
 
         # --- CA renoise timestep (uncomment one) ---
-        # uniform unit sigma, bounded by generator_t:
-        ca_timesteps = (torch.rand(batch_size, device=device) * ca_upper.float()).long()
-        # clean-bias (sigma=U**1.5), bounded by generator_t:
-        # ca_timesteps = ((torch.rand(batch_size, device=device) ** 1.5) * ca_upper.float()).long()
+        # uniform in (0, gen_sigma):
+        ca_sigmas = torch.rand(batch_size, device=device) * gen_sigma
+        ca_timesteps = (ca_sigmas * args.noise_max_t).long().clamp(max=ca_upper)
 
-        # --- DM renoise timestep (uncomment one) ---
-        # uniform:
-        dm_timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
-        # clean-bias (sigma=U**1.5):
-        # dm_timesteps = ((torch.rand(batch_size, device=device) ** 1.5) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
+        # --- DM renoise timestep ---
+        if getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None:
+            # TDM segment matching: renoise within the selected step's segment [seg_lo, seg_hi].
+            u = torch.rand(batch_size, device=device)
+            dm_timesteps = (seg_lo + u * (seg_hi - seg_lo)).long().clamp(min=0, max=args.noise_max_t - 1)
+        else:
+            # uniform (global):
+            dm_timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
 
         ca_noisy = add_flow_noise(generated_latents, ca_timesteps, args.noise_max_t)
         dm_noisy = add_flow_noise(generated_latents, dm_timesteps, args.noise_max_t)
@@ -178,17 +184,23 @@ def compute_fake_score_loss(
     img_ids: torch.Tensor,
     attn_kwargs: dict,
     model_dtype: torch.dtype,
-    args,
+    seg_lo: float | None = None,
+    seg_hi: float | None = None,
+    args=None,
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
     use_lora_scales = any(isinstance(sub, StaticMultiLoraLinear) for sub in transformer.modules())
     fake_scales = make_scales("fake", transformer, device=device) if use_lora_scales else None
 
-    # --- fake-score renoise timestep (uncomment one) ---
-    # uniform:
-    timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
-    # clean-bias: timesteps = ((torch.rand(batch_size, device=device) ** 1.5) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
+    # --- fake-score renoise timestep ---
+    if getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None:
+        # TDM segment matching: train the fake score within the selected step's segment.
+        u = torch.rand(batch_size, device=device)
+        timesteps = (seg_lo + u * (seg_hi - seg_lo)).long().clamp(min=0, max=args.noise_max_t - 1)
+    else:
+        # uniform (global):
+        timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
     clean_latents = generated_latents.detach()
     noise = torch.randn_like(clean_latents)
     sigmas = (timesteps.float() / args.noise_max_t).view(-1, 1, 1).to(device=device, dtype=clean_latents.dtype)

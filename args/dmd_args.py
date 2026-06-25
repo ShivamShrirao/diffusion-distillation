@@ -69,6 +69,18 @@ def add_decoupled_dmd_args(parser):
         help="EMA decay for the student/fake LoRA shadow. Saved as a side ema/ subdir per checkpoint. 0 disables.",
     )
     parser.add_argument(
+        "--tdm_step_list",
+        type=str,
+        default="",
+        help="TDM steps-aware training: comma-separated few-step counts to sample K from each iteration (e.g. '2,4,8'), broadcast across FSDP ranks. Empty = fixed --dmd_num_inference_steps (TDM off). Validation always uses --dmd_num_inference_steps.",
+    )
+    parser.add_argument(
+        "--tdm_segment_renoise",
+        type=int,
+        default=0,
+        help="TDM segment matching: draw the DM-update and fake-score renoise timestep uniformly WITHIN the selected step's segment [t_{i+1}, t_i] (non-overlapping intervals), instead of uniformly over the full range. 0 = global renoise.",
+    )
+    parser.add_argument(
         "--fake_lr",
         type=float,
         default=None,

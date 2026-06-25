@@ -280,12 +280,17 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             generated_latents = generated_latents - sigma * pred
             dmd_latents = generated_latents
 
+        # TDM segment: the selected step covers [seg_lo, seg_hi] in noise_max_t units (seg_lo=0 on the last step).
+        seg_hi = float(infer_timesteps[grad_step_idx])
+        seg_lo = float(infer_timesteps[grad_step_idx + 1]) if grad_step_idx + 1 < len(infer_timesteps) else 0.0
+
         return {
             "image": [height, width, device],
             "cond": [eh, te_layers, patched_image_ids, joint_attn_kwargs],
             "null": [current_null_embeds, current_null_layers],
             "rollout": [dmd_latents, do_gen_update, grad_step_idx],
             "real_latents": patched_latents,
+            "tdm": [num_inference_steps, seg_lo, seg_hi],
             "timings": [text_encoder_time, generate_time[0], mask_time[0], fetch_time_sec],
         }
 
@@ -295,6 +300,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         eh, te_layers, patched_image_ids, joint_attn_kwargs = setup["cond"]
         current_null_embeds, current_null_layers = setup["null"]
         dmd_latents, do_gen_update, grad_step_idx = setup["rollout"]
+        tdm_k, seg_lo, seg_hi = setup.get("tdm", [self.args.dmd_num_inference_steps, None, None])
         text_encoder_time, generate_time, mask_time, fetch_time_sec = setup["timings"]
         student_optimizer, fake_optimizer = self.optimizer[0], self.optimizer[1]
         student_lr_scheduler, fake_lr_scheduler = self.lr_scheduler[0], self.lr_scheduler[1]
@@ -313,6 +319,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 generated_latents=dmd_latents,
                 grad_step_idx=grad_step_idx,
                 mu=mu,
+                num_inference_steps=tdm_k,
+                seg_lo=seg_lo,
+                seg_hi=seg_hi,
                 real_transformer=real_module,
                 fake_transformer=fake_module,
                 cond_hidden_states=eh,
@@ -356,6 +365,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             img_ids=patched_image_ids,
             attn_kwargs=joint_attn_kwargs,
             model_dtype=self.weight_dtype,
+            seg_lo=seg_lo,
+            seg_hi=seg_hi,
             args=self.args,
         )
         fake_loss = fake_outputs["loss"]

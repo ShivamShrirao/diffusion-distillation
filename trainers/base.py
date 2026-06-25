@@ -283,6 +283,7 @@ class BaseTrainer:
         if self.args.resume_from_checkpoint != "no":
             # Resume at the saved completed-step count; the next sync increments to step+1.
             self.global_step = self.load_checkpoint()
+        self.args.global_step = self.global_step
 
         logger.info(f"Using adam with lr: {self.args.learning_rate}, beta2: {self.args.adam_beta2}")
 
@@ -456,11 +457,12 @@ class BaseTrainer:
         progress_bar.set_description("Steps")
 
         now = datetime.now(timezone.utc)
-        iter_ = iter(self.get_dataloader())
+        data_start_step = self.global_step * self.args.gradient_accumulation_steps
+        iter_ = iter(self.get_dataloader(start_step=data_start_step))
         epoch = 0
 
         for step in range(
-            self.global_step * self.args.gradient_accumulation_steps,
+            data_start_step,
             self.args.max_train_steps * self.args.gradient_accumulation_steps,
         ):
             # ----- next batch (recycle iterator on StopIteration) -----
@@ -472,7 +474,7 @@ class BaseTrainer:
                     fetch_time_sec = (datetime.now(timezone.utc) - fetch_start).total_seconds()
                     break
                 except StopIteration:
-                    iter_ = iter(self.get_dataloader())
+                    iter_ = iter(self.get_dataloader(start_step=step))
                     logger.info(f"Rank {self.rank} reinit iterator")
                     epoch += 1
             batch = self.BATCH_CLS.from_tuple(raw_batch)

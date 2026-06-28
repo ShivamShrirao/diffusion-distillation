@@ -47,9 +47,6 @@ def replicate_attn_mask(attn_kwargs: dict, n: int) -> dict:
 def compute_decoupled_dmd_loss(
     *,
     generated_latents: torch.Tensor,
-    grad_step_idx: int,
-    mu: float,
-    num_inference_steps: int | None = None,
     seg_lo: float | None = None,
     seg_hi: float | None = None,
     real_transformer,
@@ -70,26 +67,21 @@ def compute_decoupled_dmd_loss(
     disabled_scales = make_scales(None, real_transformer, device=device) if use_lora_scales else None
 
     with torch.no_grad():
-        # TDM steps-aware: use the active K for this iteration (falls back to the fixed arg).
-        num_inference_steps = num_inference_steps if num_inference_steps is not None else args.dmd_num_inference_steps
-        sigmas_pre = torch.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps, device=device)
-        sigma_pre_gen = sigmas_pre[grad_step_idx]
-
-        gen_sigma = torch.sigmoid(mu + torch.logit(sigma_pre_gen.clamp(min=1e-6, max=1.0 - 1e-6)))
-        ca_upper = (gen_sigma * args.noise_max_t).long()
-
-        # --- CA renoise timestep (uncomment one) ---
-        # uniform in (0, gen_sigma):
-        ca_sigmas = torch.rand(batch_size, device=device) * gen_sigma
-        ca_timesteps = (ca_sigmas * args.noise_max_t).long().clamp(max=ca_upper)
-
-        # --- DM renoise timestep ---
+        # seg_hi == t_grad == infer_timesteps[grad_step_idx]; the old linspace+logit+sigmoid
+        # recomputed exactly that flow-match time-shift, so use the rollout timestep directly.
         if getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None:
-            # TDM segment matching: renoise within the selected step's segment [seg_lo, seg_hi].
-            u = torch.rand(batch_size, device=device)
-            dm_timesteps = (seg_lo + u * (seg_hi - seg_lo)).long().clamp(min=0, max=args.noise_max_t - 1)
+            # TDM: CA (CFG anchor) and DM (distribution matching) both renoise within the
+            # selected step's segment [seg_lo, seg_hi], so each step specializes on its segment.
+            u_ca = torch.rand(batch_size, device=device)
+            ca_timesteps = (seg_lo + u_ca * (seg_hi - seg_lo)).long().clamp(min=0, max=args.noise_max_t - 1)
+            u_dm = torch.rand(batch_size, device=device)
+            dm_timesteps = (seg_lo + u_dm * (seg_hi - seg_lo)).long().clamp(min=0, max=args.noise_max_t - 1)
         else:
-            # uniform (global):
+            # Non-TDM: CA = uniform in (0, gen_sigma]; DM = global uniform.
+            gen_sigma = torch.tensor(seg_hi / args.noise_max_t, device=device)
+            ca_upper = int(seg_hi)
+            ca_sigmas = torch.rand(batch_size, device=device) * gen_sigma
+            ca_timesteps = (ca_sigmas * args.noise_max_t).long().clamp(max=ca_upper)
             dm_timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
 
         ca_noisy = add_flow_noise(generated_latents, ca_timesteps, args.noise_max_t)

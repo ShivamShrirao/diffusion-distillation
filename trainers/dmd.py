@@ -16,7 +16,7 @@ from args.data_args import add_data_args
 from args.dmd_args import add_decoupled_dmd_args
 from data.batch import T2IBatch, get_caption_short_description
 from data.build import build_dataloader_t2i
-from distributed import compile_transformer
+from distributed import compile_transformer, fsdp2_prepare_model_for_optimizer
 from lora.adapters import LORA_TARGET_MODULES
 from lora.static_multi_lora import (
     inject_multi_lora,
@@ -33,7 +33,7 @@ from losses.dmd import compute_decoupled_dmd_loss, compute_fake_score_loss
 from models.text_encoder import create_attention_matrix
 from models.transformer import Fibo2Transformer2DModel, build_transformer_config
 from models.vae import build_vae, decode_to_images
-from schedulers.flow_matching import build_infer_scheduler, build_infer_timesteps, resolve_mu
+from schedulers.flow_matching import build_infer_scheduler, build_infer_timesteps
 from schedulers.inference import predict_flow_step
 from trainers.base import BaseTrainer, logger
 
@@ -100,10 +100,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         logger.info(f"Trainable params: {n_trainable:,} / {n_total:,} ({100 * n_trainable / n_total:.3f}%)")
 
     def _configure_full_ft(self):
-        """Build fake (trainable) and real (frozen) clones of the student, then FSDP-prepare
-        all three. Under FSDP, only rank 0 holds materialised weights; other ranks stay on
-        meta and receive weights via ``sync_module_states=True`` during ``prepare``.
-        """
+        """Trainable student + trainable fake clone + frozen real teacher."""
         args = self.args
         logger.info("Using DMD full fine-tune mode (no LoRA): cloning student into fake + real transformers")
         self.transformer.requires_grad_(True)
@@ -136,13 +133,15 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.fake_transformer_unwrapped = self.fake_transformer
         self.real_transformer_unwrapped = self.real_transformer
 
-        if args.use_fsdp:
-            self.fake_transformer = self.accelerator.prepare(self.fake_transformer)
-            self.real_transformer = self.accelerator.prepare(self.real_transformer)
-
         n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.transformer.parameters())
         logger.info(f"Full-FT student trainable params: {n_trainable:,} / {n_total:,}")
+
+    def shard_trainable_models(self):
+        self.transformer = fsdp2_prepare_model_for_optimizer(self.transformer, self.accelerator)
+        if self.args.lora_rank == 0:
+            self.fake_transformer = fsdp2_prepare_model_for_optimizer(self.fake_transformer, self.accelerator)
+            self.real_transformer = fsdp2_prepare_model_for_optimizer(self.real_transformer, self.accelerator)
 
     def build_optimizer(self):
         if self.args.lora_rank == 0:
@@ -166,7 +165,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             betas=(self.args.adam_beta1, self.args.adam_beta2),
             weight_decay=self.args.adam_weight_decay,
             eps=self.args.adam_epsilon,
-            fused=True,
+            fused=not bool(self.args.use_fsdp),
+            foreach=False if self.args.use_fsdp else None,
         )
         fake_optimizer = torch.optim.AdamW(
             fake_params,
@@ -174,12 +174,15 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             betas=(self.args.adam_beta1, self.args.adam_beta2),
             weight_decay=self.args.adam_weight_decay,
             eps=self.args.adam_epsilon,
-            fused=True,
+            fused=not bool(self.args.use_fsdp),
+            foreach=False if self.args.use_fsdp else None,
         )
         self.optimizer = [student_optimizer, fake_optimizer]
+        # Accelerate-wrapped schedulers step once per process; raw FSDP2 schedulers step once.
+        scheduler_step_multiplier = 1 if self.is_fsdp2() else self.accelerator.num_processes
         self.lr_scheduler = [
-            build_lr_scheduler(self.args, student_optimizer, self.accelerator.num_processes),
-            build_lr_scheduler(self.args, fake_optimizer, self.accelerator.num_processes),
+            build_lr_scheduler(self.args, student_optimizer, scheduler_step_multiplier),
+            build_lr_scheduler(self.args, fake_optimizer, scheduler_step_multiplier),
         ]
 
     def post_optimizer_setup(self):
@@ -189,16 +192,21 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         elif self.args.lora_rank == 0 and self.args.ema_decay > 0:
             self.ema_student = FullFtEMA(self.transformer, decay=self.args.ema_decay)
             logger.info(f"Full-FT student EMA enabled with decay={self.args.ema_decay}, tracking {self.ema_student.local_numel:,} local-shard params per rank")
+            ema_init = dmd_init_path(self.args, "ema")
+            ema_fp = os.path.join(ema_init, "diffusion_pytorch_model.safetensors") if ema_init else None
+            if ema_fp and os.path.exists(ema_fp):
+                self.ema_student.load_shadow_from(ema_fp, self.transformer, bool(self.args.use_fsdp))
+                logger.info(f"Seeded EMA shadow from {ema_fp}")
 
         if self.args.lora_rank == 0 and (self.args.full_torch_compile or self.args.regional_compile):
             compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, regional=self.args.regional_compile)
             compile_transformer(self.real_transformer, self.real_transformer_unwrapped, regional=self.args.regional_compile)
 
     def _clip_grad_norm(self, model):
-        # In full-FT we prepare three same-arch FSDP modules; accelerator.clip_grad_norm_
-        # crashes inside its dispatcher (tensor list `==`), so call FSDP's sharded clip directly.
-        if self.args.use_fsdp and self.args.lora_rank == 0:
+        if self.args.use_fsdp and self.args.lora_rank == 0 and hasattr(model, "clip_grad_norm_"):
             return model.clip_grad_norm_(self.args.max_grad_norm)
+        if self.is_fsdp2():
+            return torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
         return self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
 
     @staticmethod
@@ -305,7 +313,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         eh, te_layers, patched_image_ids, joint_attn_kwargs = setup["cond"]
         current_null_embeds, current_null_layers = setup["null"]
         dmd_latents, do_gen_update, grad_step_idx = setup["rollout"]
-        tdm_k, seg_lo, seg_hi = setup.get("tdm", [self.args.dmd_num_inference_steps, None, None])
+        _, seg_lo, seg_hi = setup.get("tdm", [self.args.dmd_num_inference_steps, None, None])
         text_encoder_time, generate_time, mask_time, fetch_time_sec = setup["timings"]
         student_optimizer, fake_optimizer = self.optimizer[0], self.optimizer[1]
         student_lr_scheduler, fake_lr_scheduler = self.lr_scheduler[0], self.lr_scheduler[1]
@@ -319,12 +327,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         fake_module = self.transformer if self.args.lora_rank > 0 else self.fake_transformer
         # 1) Student update — DMD loss (internal fake DM fwd + real teacher fwd).
         if do_gen_update:
-            mu = resolve_mu(self.infer_scheduler, dmd_latents.shape[1], self.args.dmd_mu)
             dmd_outputs = compute_decoupled_dmd_loss(
                 generated_latents=dmd_latents,
-                grad_step_idx=grad_step_idx,
-                mu=mu,
-                num_inference_steps=tdm_k,
                 seg_lo=seg_lo,
                 seg_hi=seg_hi,
                 real_transformer=real_module,
@@ -353,7 +357,13 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 student_grad_norm = self._clip_grad_norm(self.transformer)
             student_optimizer.step()
             student_optimizer.zero_grad()
-            if self.accelerator.sync_gradients and self.ema_student is not None:
+            if self.accelerator.sync_gradients and self.ema_student is not None and self.global_step >= self.args.ema_start_step:
+                # Start EMA tracking at ema_start_step: re-seed the shadow from the live student
+                # on the first eligible step so it isn't anchored to the init weights.
+                if not getattr(self, "_ema_seeded", False):
+                    if hasattr(self.ema_student, "reset_to_live"):
+                        self.ema_student.reset_to_live()
+                    self._ema_seeded = True
                 self.ema_student.update()
             if fake_grad_stash is not None:
                 self._restore_optimizer_grads(fake_grad_stash)
@@ -393,7 +403,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         wandb_extras = {}
         log_every = self.args.dmd_log_image_every
-        if log_every > 0 and self.vae is not None and (self.global_step + 1) % log_every == 0:
+        if log_every > 0 and self.vae is not None and (self.global_step == 0 or (self.global_step + 1) % log_every == 0):
             wandb_extras = self._build_image_logs(
                 generated_latents=dmd_latents.detach(),
                 dmd_log_latents=dmd_outputs["log_latents"] if (do_gen_update and dmd_outputs is not None) else None,
@@ -436,8 +446,6 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.args.checkpoint_local_path,
             f"checkpoint_{self.global_step:06d}",
         )
-        if getattr(self.accelerator.state, "fsdp_plugin", None) is not None:
-            self.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
         self.accelerator.wait_for_everyone()
         if self.args.lora_rank == 0:
             self._save_full_ft_checkpoint(save_path)

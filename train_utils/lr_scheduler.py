@@ -15,8 +15,7 @@ def get_cosine_schedule_with_warmup_and_decay(
     """Warmup → constant → linear-decay LR schedule.
 
     If `constant_steps <= 0`, the constant region extends from warmup end to training end
-    (i.e. no decay tail). Accelerate passes `current_step * num_processes` to the lambda,
-    so callers pre-multiply both `num_warmup_steps` and `num_training_steps` accordingly.
+    (i.e. no decay tail).
     """
     if constant_steps <= 0:
         constant_steps = num_training_steps - num_warmup_steps
@@ -34,11 +33,11 @@ def get_cosine_schedule_with_warmup_and_decay(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def build_lr_scheduler(args, optimizer, num_processes: int):
+def build_lr_scheduler(args, optimizer, step_multiplier: int):
     name = args.lr_scheduler
-    num_warmup = args.lr_warmup_steps * num_processes
-    num_training = args.max_train_steps * num_processes
-    constant_steps = args.constant_steps * num_processes
+    num_warmup = args.lr_warmup_steps * step_multiplier
+    num_training = args.max_train_steps * step_multiplier
+    constant_steps = args.constant_steps * step_multiplier
     if name != "constant_with_warmup_cosine_decay":
         return get_scheduler(
             name=name,

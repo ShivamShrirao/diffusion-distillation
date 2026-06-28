@@ -69,6 +69,12 @@ def add_decoupled_dmd_args(parser):
         help="EMA decay for the student/fake LoRA shadow. Saved as a side ema/ subdir per checkpoint. 0 disables.",
     )
     parser.add_argument(
+        "--ema_start_step",
+        type=int,
+        default=0,
+        help="global_step at which EMA starts tracking; the shadow is re-seeded from the live student then.",
+    )
+    parser.add_argument(
         "--tdm_step_list",
         type=str,
         default="",

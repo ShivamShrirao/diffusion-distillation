@@ -44,6 +44,12 @@ def add_base_args(parser):
         help="Optional DMD checkpoint `fake/` dir to cold-start the fake critic from.",
     )
     parser.add_argument(
+        "--ema_init",
+        type=str,
+        default=None,
+        help="Optional DMD checkpoint `ema/` dir to seed the full-FT student EMA shadow from.",
+    )
+    parser.add_argument(
         "--transformer_init",
         type=str,
         default=None,

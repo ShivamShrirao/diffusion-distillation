@@ -53,29 +53,31 @@ def create_attention_matrix(attention_mask: torch.Tensor) -> torch.Tensor:
     return torch.where(attention_matrix == 1, 0.0, -torch.inf)
 
 
+def freeze_model(model, device):
+    """Put a frozen model on the compute device in eval mode."""
+    model = model.to(device)
+    return model.eval().requires_grad_(False)
+
+
 def init_text_encoder(model_path: str, device, weight_dtype):
     """Load the Qwen3-VL text encoder + processor and return its prompt-embed callable."""
     print("Loading Qwen3-VL text encoder")
     processor = Qwen3VLProcessor.from_pretrained(model_path, subfolder="processor")
-    text_encoder = (
-        Qwen3VLForConditionalGeneration.from_pretrained(
-            model_path, subfolder="text_encoder", torch_dtype=weight_dtype, low_cpu_mem_usage=True
-        )
-        .to(device)
-        .eval()
-        .requires_grad_(False)
+    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_path, subfolder="text_encoder", torch_dtype=weight_dtype, low_cpu_mem_usage=True
     )
+    text_encoder = freeze_model(text_encoder, device)
     return processor, text_encoder, get_qwen3vl_prompt_embeds
 
 
-def build_text_encoder(args, accelerator, weight_dtype):
+def build_text_encoder(args, device, weight_dtype):
     """Returns `(processor, encoder, get_prompt_embeds_fn)` for use in the training loop.
 
     The returned callable has signature `(prompts) -> (embeds, hidden_states, attn_mask)`
     and closes over `args.max_sequence_length`.
     """
     processor, text_encoder, encoder_callable = init_text_encoder(
-        args.pretrained_model_name_or_path, accelerator.device, weight_dtype
+        args.pretrained_model_name_or_path, device, weight_dtype
     )
 
     def get_prompt_embeds(prompts):

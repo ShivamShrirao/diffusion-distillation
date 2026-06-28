@@ -2,6 +2,13 @@ import os
 
 import torch
 from safetensors.torch import save_file
+from torch.distributed.tensor import DTensor
+
+
+def local_shard(t):
+    """Rank-local shard of an FSDP2 DTensor (shares storage, so in-place ops hit the live
+    param); a plain tensor passes through unchanged."""
+    return t.to_local() if isinstance(t, DTensor) else t
 
 
 class LoraEMA:
@@ -34,26 +41,27 @@ class LoraEMA:
             raise RuntimeError(f"LoraEMA: no trainable lora_ params matched adapter '{adapter_name}'")
         # Shadow kept in float32: with decay=0.987 the per-step update is alpha≈0.013,
         # which bf16 mantissa would silently truncate over many steps.
-        self.shadow = {n: p.detach().to(torch.float32).clone() for n, p in self.named_live}
+        self.shadow = {n: local_shard(p.data).detach().to(torch.float32).clone() for n, p in self.named_live}
 
     @torch.no_grad()
     def update(self):
         alpha = 1.0 - self.decay
         for n, p in self.named_live:
-            self.shadow[n].lerp_(p.data.to(torch.float32), alpha)
+            self.shadow[n].lerp_(local_shard(p.data).to(torch.float32), alpha)
 
     @torch.no_grad()
     def swap_in(self):
         saved = {}
         for n, p in self.named_live:
-            saved[n] = p.data.clone()
-            p.data.copy_(self.shadow[n].to(p.dtype))
+            shard = local_shard(p.data)
+            saved[n] = shard.clone()
+            shard.copy_(self.shadow[n].to(p.dtype))
         return saved
 
     @torch.no_grad()
     def swap_out(self, saved):
         for n, p in self.named_live:
-            p.data.copy_(saved[n])
+            local_shard(p.data).copy_(saved[n])
 
     def save(self, save_dir: str, accelerator, transformer, transformer_unwrapped):
         """Gather full unsharded weights with EMA swapped in, write a PEFT adapter
@@ -63,8 +71,6 @@ class LoraEMA:
 
         saved = self.swap_in()
         try:
-            if getattr(accelerator.state, "fsdp_plugin", None) is not None:
-                accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
             full_sd = accelerator.get_state_dict(transformer, unwrap=False)
         finally:
             self.swap_out(saved)
@@ -80,50 +86,75 @@ class LoraEMA:
 
 
 class FullFtEMA:
-    """EMA shadow over an FSDP-wrapped student transformer's full parameters.
-
-    Parallel to LoraEMA but operates on the per-shard FlatParameter list (rather than
-    name-keyed adapter params), so each rank EMAs only its own local shard — no
-    collectives per step, shard layout matches by construction.
-
-    Shadow kept in float32: with decay=0.999 the per-step alpha is 1e-3, which bf16
-    mantissa would silently truncate. Memory cost per rank ≈ fp32 size of the local
-    FSDP shard (e.g. ~2.5 GB for a 5B-param student sharded across 8 H200s).
-
-    EMA resume from a previous run is not supported; cold-start initialises the shadow
-    from current live student weights.
-    """
+    """EMA over a full-FT student's params. Under FSDP2 each param is a sharded DTensor, so
+    ``local_shard`` keeps every op on the rank-local slice (no collectives). Shadow in float32
+    (decay~0.999 -> alpha 1e-3, below bf16 resolution). ``load_shadow_from`` re-seeds on resume."""
 
     def __init__(self, transformer, decay: float):
         self.decay = decay
         self.live = list(transformer.parameters())
-        self.shadow = [p.data.detach().to(torch.float32).clone() for p in self.live]
+        self.shadow = [local_shard(p.data).detach().to(torch.float32).clone() for p in self.live]
 
     @torch.no_grad()
     def update(self):
         alpha = 1.0 - self.decay
         for ema, p in zip(self.shadow, self.live):
-            ema.lerp_(p.data.to(torch.float32), alpha)
+            ema.lerp_(local_shard(p.data).to(torch.float32), alpha)
+
+    @torch.no_grad()
+    def reset_to_live(self):
+        """Re-seed the shadow from the current live weights (e.g. to start EMA tracking
+        at a later step rather than from the init weights)."""
+        for ema, p in zip(self.shadow, self.live):
+            ema.copy_(local_shard(p.data).to(torch.float32))
 
     @torch.no_grad()
     def swap_in(self):
-        saved = [p.data.clone() for p in self.live]
+        saved = []
         for p, ema in zip(self.live, self.shadow):
-            p.data.copy_(ema.to(p.dtype))
+            shard = local_shard(p.data)
+            saved.append(shard.clone())
+            shard.copy_(ema.to(p.dtype))
         return saved
 
     @torch.no_grad()
     def swap_out(self, saved):
         for p, s in zip(self.live, saved):
-            p.data.copy_(s)
+            local_shard(p.data).copy_(s)
+
+    @torch.no_grad()
+    def load_shadow_from(self, fpath: str, fsdp_root, use_fsdp: bool):
+        from safetensors.torch import load_file
+
+        full_sd = load_file(fpath)
+        saved = [local_shard(p.data).clone() for p in self.live]
+        self.scatter_full_into_live(full_sd, fsdp_root, use_fsdp)
+        for ema, p in zip(self.shadow, self.live):
+            ema.copy_(local_shard(p.data).to(torch.float32))
+        for p, s in zip(self.live, saved):
+            local_shard(p.data).copy_(s)
+
+    @staticmethod
+    @torch.no_grad()
+    def scatter_full_into_live(full_sd: dict, fsdp_root, use_fsdp: bool):
+        """Scatter a full state dict into the live FSDP2 model via DCP ``set_model_state_dict``;
+        every rank passes the full sd it loaded and takes its own shard."""
+        if not use_fsdp:
+            fsdp_root.load_state_dict(full_sd, strict=False)
+            return
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+        set_model_state_dict(
+            fsdp_root,
+            full_sd,
+            options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=False, strict=False),
+        )
 
     def save(self, save_dir: str, accelerator, transformer, transformer_unwrapped):
         """Gather full unsharded weights with EMA swapped in, write
         ``{save_dir}/ema/diffusion_pytorch_model.safetensors`` + ``config.json``."""
         saved = self.swap_in()
         try:
-            if getattr(accelerator.state, "fsdp_plugin", None) is not None:
-                accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
             ema_sd = accelerator.get_state_dict(transformer, unwrap=False)
             if accelerator.is_main_process:
                 ema_dir = os.path.join(save_dir, "ema")

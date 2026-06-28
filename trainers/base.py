@@ -48,7 +48,7 @@ from args.base_args import add_base_args, read_config_defaults
 from args.data_args import add_data_args
 from data.batch import T2IBatch, get_caption_short_description
 from data.build import build_dataloader_t2i
-from distributed import build_accelerator, compile_transformer, set_nccl_env
+from distributed import build_accelerator, compile_transformer, fsdp2_prepare_model_for_optimizer, set_nccl_env
 from lora.adapters import add_lora
 from train_utils.checkpoint import resolve_resume_checkpoint
 from train_utils.lr_scheduler import build_lr_scheduler
@@ -226,13 +226,13 @@ class BaseTrainer:
         logger.info(f"Trainable transformer Parameters: {trainable_param_count / 10**9}B")
         if self.args.gradient_checkpointing:
             self.transformer.enable_gradient_checkpointing()
-        if self.args.use_fsdp:
-            self.transformer = self.accelerator.prepare(self.transformer)
+        if self.is_fsdp2():
+            self.shard_trainable_models()
         logger.info(f"Using precision of {self.weight_dtype}")
 
         self.tokenizer, self.text_encoder, self.get_prompt_embedds = build_text_encoder(
             self.args,
-            self.accelerator,
+            self.accelerator.device,
             self.weight_dtype,
         )
 
@@ -248,18 +248,12 @@ class BaseTrainer:
         self.vae_scale_factor = vae_scale_factor_from_config(self.vae_config)
         self.compute_mfu_constants()
 
-        if self.args.use_fsdp:
-            num_optimizers = len(self.optimizer)
-            prepared = self.accelerator.prepare(*self.optimizer, *self.lr_scheduler)
-            self.optimizer = list(prepared[:num_optimizers])
-            self.lr_scheduler = list(prepared[num_optimizers:])
-        else:
-            num_optimizers = len(self.optimizer)
+        if not self.is_fsdp2():
+            num_opt = len(self.optimizer)
             prepared = self.accelerator.prepare(self.transformer, *self.optimizer, *self.lr_scheduler)
             self.transformer = prepared[0]
-            prepared = prepared[1:]
-            self.optimizer = list(prepared[:num_optimizers])
-            self.lr_scheduler = list(prepared[num_optimizers:])
+            self.optimizer = list(prepared[1 : 1 + num_opt])
+            self.lr_scheduler = list(prepared[1 + num_opt :])
 
         self.post_optimizer_setup()
 
@@ -318,10 +312,20 @@ class BaseTrainer:
             betas=(self.args.adam_beta1, self.args.adam_beta2),
             weight_decay=self.args.adam_weight_decay,
             eps=self.args.adam_epsilon,
-            fused=True,
+            fused=not bool(self.args.use_fsdp),
+            foreach=False if self.args.use_fsdp else None,
         )
         self.optimizer = [optimizer]
-        self.lr_scheduler = [build_lr_scheduler(self.args, optimizer, self.accelerator.num_processes)]
+        # Accelerate-wrapped schedulers step once per process; raw FSDP2 schedulers step once.
+        scheduler_step_multiplier = 1 if self.is_fsdp2() else self.accelerator.num_processes
+        self.lr_scheduler = [build_lr_scheduler(self.args, optimizer, scheduler_step_multiplier)]
+
+    def is_fsdp2(self):
+        plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+        return plugin is not None and getattr(plugin, "fsdp_version", None) == 2
+
+    def shard_trainable_models(self):
+        self.transformer = fsdp2_prepare_model_for_optimizer(self.transformer, self.accelerator)
 
     def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
         """Simple T2I flow-matching denoising step.
@@ -736,8 +740,6 @@ class BaseTrainer:
             f"checkpoint_{self.global_step:06d}",
         )
         if self.args.lora_rank > 0:
-            if getattr(self.accelerator.state, "fsdp_plugin", None) is not None:
-                self.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
             self.accelerator.wait_for_everyone()
             logger.info(f"Saving LoRA checkpoint to {save_path}")
             state_dict = self.accelerator.get_state_dict(self.transformer, unwrap=False)

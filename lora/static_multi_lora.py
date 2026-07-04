@@ -1,8 +1,11 @@
 """Static multi-adapter LoRA used by DMD.
 
-Adapter choice is a tensor (`lora_scales`) threaded through block forwards, so
-torch.compile sees stable Python control flow and checkpoint recompute gets the
-same adapter scales as the original forward.
+Adapter choice is a tuple of Python floats (`lora_scales`) threaded through
+block forwards, so checkpoint recompute gets the same adapter scales as the
+original forward. Zero-scaled adapters are skipped entirely in the forward:
+the branch is on a Python float, so torch.compile just specializes per
+scale-set (scales only flip between a few fixed configurations, so the
+recompile count is bounded).
 """
 
 from __future__ import annotations
@@ -49,8 +52,8 @@ class StaticMultiLoraLinear(nn.Module):
             self.lora_B[name] = b
             self.lora_dropout[name] = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
             scaling_vals.append(float(eff_alpha) / float(rank))
-        self.register_buffer("scaling", torch.tensor(scaling_vals, dtype=torch.float32), persistent=False)
-        self._lora_scales: torch.Tensor | None = None
+        self.scaling = tuple(scaling_vals)
+        self._lora_scales: tuple[float, ...] | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         result = self.base_layer(x)
@@ -59,10 +62,14 @@ class StaticMultiLoraLinear(nn.Module):
         if scales is None:
             return result
         for i, name in enumerate(self.adapter_names):
+            # Python-float branch: zero-scaled adapters cost nothing, and no
+            # zero grads are written to their params (grad stays None).
+            coeff = scales[i] * self.scaling[i]
+            if coeff == 0.0:
+                continue
             xi = x.to(self.lora_A[name].weight.dtype)
             xi = self.lora_dropout[name](xi)
-            lora_out = self.lora_B[name](self.lora_A[name](xi)) * self.scaling[i]
-            result = result + scales[i].to(lora_out.dtype) * lora_out
+            result = result + self.lora_B[name](self.lora_A[name](xi)) * coeff
         return result.to(result_dtype)
 
 
@@ -95,7 +102,7 @@ def inject_multi_lora(
     return replaced
 
 
-def make_scales(active_adapter: str | None, transformer: nn.Module, device, dtype=torch.float32) -> torch.Tensor:
+def make_scales(active_adapter: str | None, transformer: nn.Module) -> tuple[float, ...]:
     names = None
     for sub in _root(transformer).modules():
         if isinstance(sub, StaticMultiLoraLinear):
@@ -103,10 +110,9 @@ def make_scales(active_adapter: str | None, transformer: nn.Module, device, dtyp
             break
     if names is None:
         raise RuntimeError("No StaticMultiLoraLinear found; call inject_multi_lora first.")
-    scales = torch.zeros(len(names), device=device, dtype=dtype)
-    if active_adapter is not None:
-        scales[names.index(active_adapter)] = 1.0
-    return scales
+    if active_adapter is not None and active_adapter not in names:
+        raise ValueError(f"Unknown adapter '{active_adapter}'; expected one of {names}")
+    return tuple(1.0 if name == active_adapter else 0.0 for name in names)
 
 
 def lora_scales_pre_hook(module, args, kwargs):
@@ -209,7 +215,7 @@ def build_peft_lora_config(transformer: nn.Module, adapter_name: str) -> LoraCon
             continue
         idx = sub.adapter_names.index(adapter_name)
         r = sub.lora_A[adapter_name].out_features
-        a = int(round(float(sub.scaling[idx].item()) * r))
+        a = int(round(sub.scaling[idx] * r))
         d_mod = sub.lora_dropout[adapter_name]
         d = float(getattr(d_mod, "p", 0.0)) if not isinstance(d_mod, nn.Identity) else 0.0
         if rank is None:

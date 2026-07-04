@@ -39,6 +39,21 @@ def resolve_dtype(mixed_precision: str) -> torch.dtype:
     return torch.float32
 
 
+class CudaTiming:
+    """Deferred GPU-interval reading: resolves to seconds only when consumed (at wandb-log
+    time), so the hot loop never calls torch.cuda.synchronize(). float() waits on the end
+    event only — a bounded, single-stream sync instead of a device-wide one."""
+
+    def __init__(self, before_event, after_event):
+        self.before_event = before_event
+        self.after_event = after_event
+
+    def __float__(self):
+        if not self.after_event.query():
+            self.after_event.synchronize()
+        return self.before_event.elapsed_time(self.after_event) / 1000
+
+
 class CudaTimerContext:
     def __init__(self, times_arr):
         self.times_arr = times_arr
@@ -50,9 +65,7 @@ class CudaTimerContext:
 
     def __exit__(self, type, value, traceback):
         self.after_event.record()
-        torch.cuda.synchronize()
-        elapsed_time = self.before_event.elapsed_time(self.after_event) / 1000
-        self.times_arr.append(elapsed_time)
+        self.times_arr.append(CudaTiming(self.before_event, self.after_event))
 
 
 def init_wandb(accelerator, args, project_name: str = "image-model", extend_name: bool = False):

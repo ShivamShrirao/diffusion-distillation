@@ -145,7 +145,8 @@ def build_transformer(args, vae_config: dict, accelerator, logger):
     assert vae_config["latent_channels"] == transformer.config.in_channels
 
     if args.transformer_init:
-        if (args.use_fsdp and accelerator.is_main_process) or not args.use_fsdp:
+        # Under FSDP only rank 0 loads; fsdp2_shard_model scatters the weights to all ranks.
+        if not args.use_fsdp or accelerator.is_main_process:
             load_transformer_init_weights(transformer, args.transformer_init, logger)
 
     total_num_layers = len(transformer.config.injection_layer_ids)

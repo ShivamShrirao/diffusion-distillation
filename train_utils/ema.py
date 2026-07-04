@@ -11,6 +11,19 @@ def local_shard(t):
     return t.to_local() if isinstance(t, DTensor) else t
 
 
+def foreach_lerp_shadow(shadow: list, live: list, alpha: float):
+    """`shadow.lerp_(live, alpha)` over parameter lists in a handful of batched kernels
+    instead of one launch per tensor (~1000 for the full-FT student). Same-dtype pairs go
+    through `_foreach_lerp_`; mismatched pairs (e.g. bf16 live vs fp32 shadow) fall back to
+    the per-tensor upcast path, preserving the fp32 accumulation."""
+    matched = [(s, t) for s, t in zip(shadow, live) if s.dtype == t.dtype]
+    if matched:
+        torch._foreach_lerp_([s for s, _ in matched], [t for _, t in matched], alpha)
+    for s, t in zip(shadow, live):
+        if s.dtype != t.dtype:
+            s.lerp_(t.to(s.dtype), alpha)
+
+
 class LoraEMA:
     """EMA shadow over one named LoRA adapter, stored as a side dict (not in the module tree).
 
@@ -46,8 +59,9 @@ class LoraEMA:
     @torch.no_grad()
     def update(self):
         alpha = 1.0 - self.decay
-        for n, p in self.named_live:
-            self.shadow[n].lerp_(local_shard(p.data).to(torch.float32), alpha)
+        shadow = [self.shadow[n] for n, _ in self.named_live]
+        live = [local_shard(p.data) for _, p in self.named_live]
+        foreach_lerp_shadow(shadow, live, alpha)
 
     @torch.no_grad()
     def swap_in(self):
@@ -98,8 +112,7 @@ class FullFtEMA:
     @torch.no_grad()
     def update(self):
         alpha = 1.0 - self.decay
-        for ema, p in zip(self.shadow, self.live):
-            ema.lerp_(local_shard(p.data).to(torch.float32), alpha)
+        foreach_lerp_shadow(self.shadow, [local_shard(p.data) for p in self.live], alpha)
 
     @torch.no_grad()
     def reset_to_live(self):
@@ -137,38 +150,40 @@ class FullFtEMA:
     @staticmethod
     @torch.no_grad()
     def scatter_full_into_live(full_sd: dict, fsdp_root, use_fsdp: bool):
-        """Scatter a full state dict into the live FSDP2 model via DCP ``set_model_state_dict``;
-        every rank passes the full sd it loaded and takes its own shard."""
+        """Scatter a full state dict into the live model; shard-aware under FSDP2."""
         if not use_fsdp:
             fsdp_root.load_state_dict(full_sd, strict=False)
             return
-        from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+        from distributed import fsdp2_load_full_state
 
-        set_model_state_dict(
-            fsdp_root,
-            full_sd,
-            options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=False, strict=False),
-        )
+        fsdp2_load_full_state(fsdp_root, full_sd)
 
-    def save(self, save_dir: str, accelerator, transformer, transformer_unwrapped):
-        """Gather full unsharded weights with EMA swapped in, write
-        ``{save_dir}/ema/diffusion_pytorch_model.safetensors`` + ``config.json``."""
+    def save(self, save_dir: str, accelerator, transformer, transformer_unwrapped, writes: list | None = None):
+        """Gather full unsharded weights with EMA swapped in (collective), write
+        ``{save_dir}/ema/diffusion_pytorch_model.safetensors`` + ``config.json`` on rank 0.
+        With ``writes`` the write is appended as a closure for ``write_checkpoint_async``."""
         saved = self.swap_in()
         try:
             ema_sd = accelerator.get_state_dict(transformer, unwrap=False)
-            if accelerator.is_main_process:
-                ema_dir = os.path.join(save_dir, "ema")
-                os.makedirs(ema_dir, exist_ok=True)
-                transformer_unwrapped.save_config(ema_dir)
-                cleaned = {
-                    k.replace("module.", "").replace("._orig_mod", ""): v.contiguous()
-                    for k, v in ema_sd.items()
-                }
-                save_file(cleaned, os.path.join(ema_dir, "diffusion_pytorch_model.safetensors"))
-                del cleaned
-            del ema_sd
         finally:
             self.swap_out(saved)
+        if not accelerator.is_main_process:
+            return
+
+        def write(out_dir: str):
+            ema_dir = os.path.join(out_dir, "ema")
+            os.makedirs(ema_dir, exist_ok=True)
+            transformer_unwrapped.save_config(ema_dir)
+            cleaned = {
+                k.replace("module.", "").replace("._orig_mod", ""): v.contiguous()
+                for k, v in ema_sd.items()
+            }
+            save_file(cleaned, os.path.join(ema_dir, "diffusion_pytorch_model.safetensors"))
+
+        if writes is None:
+            write(save_dir)
+        else:
+            writes.append(write)
 
     @property
     def local_numel(self) -> int:

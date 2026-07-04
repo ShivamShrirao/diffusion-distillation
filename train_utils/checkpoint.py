@@ -1,11 +1,14 @@
+import logging
 import os
 import shutil
 import threading
-from pathlib import Path
 
-from accelerate.logging import get_logger
+# stdlib logger, not accelerate's: these messages come from a rank-0-only background
+# thread, and the failure path must never itself raise (accelerate's logger asserts on
+# process state).
+logger = logging.getLogger(__name__)
 
-_logger = get_logger(__name__, log_level="INFO")
+pending_checkpoint_thread = None
 
 
 def resolve_resume_checkpoint(args):
@@ -28,55 +31,50 @@ def resolve_resume_checkpoint(args):
     return full
 
 
-class AsyncCheckpointSaver:
-    """Stage checkpoint dir on /dev/shm, then async-move it to the final destination.
+def finish_pending_checkpoint():
+    """Block until the previous async checkpoint write (if any) has fully landed."""
+    global pending_checkpoint_thread
+    t = pending_checkpoint_thread
+    pending_checkpoint_thread = None
+    if t is not None:
+        t.join()
 
-    Usage:
-        with AsyncCheckpointSaver(final_save_path, is_main_process) as temp_path:
-            accelerator.save_state(temp_path)
-        # context exit kicks off the move
+
+def write_checkpoint_async(final_path: str, writes: list, is_main_process: bool):
+    """Run `writes` (closures taking a staging dir) in a background thread, then publish
+    the staging dir at `final_path` with an atomic rename.
+
+    The training loop only pays for the (collective) state-dict gathers; serializing
+    50-100GB of safetensors to disk overlaps with the next steps. The staging dir is
+    hidden (`.writing_<name>`) so `resolve_resume_checkpoint` never picks up a
+    half-written checkpoint; a crash mid-write leaves only the hidden dir behind.
+
+    Joins the previous pending write first, so at most one checkpoint's gathered state
+    is held in RAM at a time. Gathers must happen BEFORE this call — the closures run
+    off-thread and must only touch CPU tensors and disk. Non-main ranks pass through
+    (their `writes` list is empty). The thread is non-daemon: process exit waits for
+    the write to finish rather than corrupting it.
     """
+    finish_pending_checkpoint()
+    if not is_main_process:
+        return
 
-    _lock = threading.Lock()
-    _last_move_thread = None
-
-    def __init__(self, final_save_path: str, is_main_process: bool):
-        self.final_save_path = Path(final_save_path)
-        self.temp_dir = None
-        self.is_main_process = is_main_process
-
-    def __enter__(self):
-        checkpoint_name = self.final_save_path.name
-        self.temp_dir = Path("/dev/shm/") / checkpoint_name
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-        return str(self.temp_dir)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if not self.is_main_process:
-            return False
-        t = threading.Thread(
-            target=self._move_checkpoint,
-            args=(self.temp_dir, self.final_save_path),
-            daemon=False,
-        )
-        with AsyncCheckpointSaver._lock:
-            if AsyncCheckpointSaver._last_move_thread and AsyncCheckpointSaver._last_move_thread.is_alive():
-                AsyncCheckpointSaver._last_move_thread.join()
-            AsyncCheckpointSaver._last_move_thread = t
-        t.start()
-        return False
-
-    @staticmethod
-    def _move_checkpoint(temp_dir: Path, final_path: Path):
+    def run():
+        staging = os.path.join(os.path.dirname(final_path), f".writing_{os.path.basename(final_path)}")
         try:
-            _logger.info(f"Moving checkpoint from {temp_dir} to {final_path}")
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            if final_path.exists():
+            if os.path.exists(staging):
+                shutil.rmtree(staging)
+            os.makedirs(staging)
+            for write in writes:
+                write(staging)
+            if os.path.exists(final_path):
                 shutil.rmtree(final_path)
-            shutil.move(str(temp_dir), str(final_path))
-            _logger.info(f"Successfully moved checkpoint from {temp_dir} to {final_path}")
-        except Exception as e:
-            _logger.error(f"Error moving checkpoint from {temp_dir} to {final_path}: {e}")
-        finally:
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir)
+            os.replace(staging, final_path)
+            logger.info(f"Async checkpoint write complete: {final_path}")
+        except Exception:
+            logger.error(f"Async checkpoint write FAILED for {final_path}", exc_info=True)
+            shutil.rmtree(staging, ignore_errors=True)
+
+    global pending_checkpoint_thread
+    pending_checkpoint_thread = threading.Thread(target=run, daemon=False, name="checkpoint-writer")
+    pending_checkpoint_thread.start()

@@ -104,6 +104,13 @@ def add_base_args(parser):
     parser.add_argument("--full_torch_compile", type=int, default=0)
     parser.add_argument("--regional_compile", type=int, default=0)
     parser.add_argument(
+        "--attn_backend",
+        type=str,
+        default="fa3",
+        choices=["native", "fa3"],
+        help="Transformer attention path. fa3 (default): FlashAttention-3 hub kernel in varlen mode; needs the `kernels` package, an FA3-capable GPU and HF-hub access at startup. native: SDPA.",
+    )
+    parser.add_argument(
         "--denoising_loss_scale",
         type=float,
         default=1.0,

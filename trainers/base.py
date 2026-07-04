@@ -48,12 +48,15 @@ from args.base_args import add_base_args, read_config_defaults
 from args.data_args import add_data_args
 from data.batch import T2IBatch, get_caption_short_description
 from data.build import build_dataloader_t2i
-from distributed import build_accelerator, compile_transformer, fsdp2_prepare_model_for_optimizer, set_nccl_env
+from safetensors.torch import load_file, save_file
+
+from distributed import build_accelerator, compile_transformer, fsdp2_load_full_state, fsdp2_shard_model, set_nccl_env
 from lora.adapters import add_lora
-from train_utils.checkpoint import resolve_resume_checkpoint
+from train_utils.checkpoint import resolve_resume_checkpoint, write_checkpoint_async
 from train_utils.lr_scheduler import build_lr_scheduler
 from train_utils.runtime import (
     CudaTimerContext,
+    CudaTiming,
     get_logger,
     init_wandb,
     resolve_dtype,
@@ -61,7 +64,8 @@ from train_utils.runtime import (
     setup_root_logger,
 )
 from losses.denoising import compute_denoising_loss
-from models.text_encoder import build_text_encoder, create_attention_matrix, pad_embedding
+from models.text_encoder import build_text_encoder, pad_embedding
+from train_utils.attention import build_attention_mask, diffusers_backend_name, warmup_fa3_kernel
 from models.transformer import build_transformer
 from models.vae import build_vae_config, vae_scale_factor_from_config, decode_to_images
 from train_utils.packing import apply_cfg_dropout_t2i, pack_t2i, unpack_to_image
@@ -149,6 +153,7 @@ class BaseTrainer:
         # Accumulators reset at every sync_gradients step.
         self.train_loss = 0.0
         self.named_loss_acc: dict[str, float] = {}
+        self.null_cond_cache: dict = {}
 
     # ---------------------------------------------------------------
     # Override hooks
@@ -206,6 +211,12 @@ class BaseTrainer:
 
         self.vae_config = build_vae_config()
 
+        # Warm the FA3 hub kernel once per node (local-main-first) BEFORE any model sets its
+        # attention backend — extra_setup/configure_transformer/the main transformer below all
+        # call set_attention_backend, and ungated each rank would re-fetch the ~824MB kernel.
+        if self.args.attn_backend == "fa3":
+            warmup_fa3_kernel(self.accelerator)
+
         # Reward / perceptual / ref-transformer models, and the VAE itself for trainers
         # that decode pixels (DMD-with-image-logging). Lives BEFORE the main
         # transformer so a subclass can size its reward stack against the args first.
@@ -219,6 +230,9 @@ class BaseTrainer:
         )
         self.transformer_inner_dim = self.transformer.inner_dim
         self.configure_transformer()
+        if self.args.attn_backend != "native":
+            self.transformer.set_attention_backend(diffusers_backend_name(self.args.attn_backend))
+            logger.info(f"Attention backend: {self.args.attn_backend}")
         self.transformer_unwrapped = self.transformer
         self.transformer_param_count = sum(p.numel() for p in self.transformer.parameters())
         trainable_param_count = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
@@ -293,39 +307,64 @@ class BaseTrainer:
         self.val_prompts = self.load_validation_prompts()
         self.transformer.train()
 
-    def null_conditioning_for(self, bsz: int, num_text_tokens: int):
+    def null_conditioning_for(self, bsz: int, num_text_tokens: int, dtype: torch.dtype | None = None):
         """Null (empty-prompt) CFG embeddings padded to `num_text_tokens`, sized to `bsz`.
 
         For explicit-uncond consumers (paired 1:1 with the conditional batch); the
         broadcasting `torch.where` consumers use `self.null_conditioning` directly.
+        Cached per (bsz, num_text_tokens, dtype) — the null embedding is constant, and
+        rebuilding + repeating ~60 layer tensors per step is pure launch overhead.
+        Callers must not mutate the returned tensors.
         """
-        emb, _ = pad_embedding(self.null_conditioning, max_tokens=num_text_tokens)
-        emb = emb.repeat(bsz, 1, 1)
-        layers = [pad_embedding(layer, max_tokens=num_text_tokens)[0].repeat(bsz, 1, 1) for layer in self.null_conditioning_layers]
-        return emb, layers
+        key = (bsz, num_text_tokens, dtype)
+        cached = self.null_cond_cache.get(key)
+        if cached is None:
+            emb, _ = pad_embedding(self.null_conditioning, max_tokens=num_text_tokens)
+            emb = emb.repeat(bsz, 1, 1)
+            layers = [pad_embedding(layer, max_tokens=num_text_tokens)[0].repeat(bsz, 1, 1) for layer in self.null_conditioning_layers]
+            if dtype is not None:
+                emb = emb.to(dtype)
+                layers = [layer.to(dtype) for layer in layers]
+            if len(self.null_cond_cache) >= 4:
+                self.null_cond_cache.pop(next(iter(self.null_cond_cache)))
+            cached = self.null_cond_cache[key] = (emb, layers)
+        return cached
 
-    def build_optimizer(self):
-        parameters = [p for p in self.transformer.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(
-            parameters,
-            lr=self.args.learning_rate,
+    def adamw_kwargs(self):
+        """AdamW kwargs shared by every optimizer (base + DMD student/fake).
+        fused=True matches the pre-FSDP2 code and works on FSDP2 DTensor params."""
+        return dict(
             betas=(self.args.adam_beta1, self.args.adam_beta2),
             weight_decay=self.args.adam_weight_decay,
             eps=self.args.adam_epsilon,
-            fused=not bool(self.args.use_fsdp),
-            foreach=False if self.args.use_fsdp else None,
+            fused=True,
         )
+
+    def build_scheduler(self, optimizer):
+        # Accelerate-wrapped schedulers step num_processes times per call; raw FSDP2
+        # schedulers step once, so their warmup/decay horizons are not pre-multiplied.
+        return build_lr_scheduler(self.args, optimizer, 1 if self.is_fsdp2() else self.accelerator.num_processes)
+
+    def build_optimizer(self):
+        parameters = [p for p in self.transformer.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(parameters, lr=self.args.learning_rate, **self.adamw_kwargs())
         self.optimizer = [optimizer]
-        # Accelerate-wrapped schedulers step once per process; raw FSDP2 schedulers step once.
-        scheduler_step_multiplier = 1 if self.is_fsdp2() else self.accelerator.num_processes
-        self.lr_scheduler = [build_lr_scheduler(self.args, optimizer, scheduler_step_multiplier)]
+        self.lr_scheduler = [self.build_scheduler(optimizer)]
 
     def is_fsdp2(self):
         plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
         return plugin is not None and getattr(plugin, "fsdp_version", None) == 2
 
+    def clip_grad_norm(self, model):
+        """Clip grads of one model, returning the total norm. Manually sharded FSDP2 models
+        are not registered with Accelerate, so clip directly with the DTensor-aware torch
+        util; otherwise defer to Accelerate (which also unscales fp16 grads)."""
+        if self.is_fsdp2():
+            return torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+        return self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+
     def shard_trainable_models(self):
-        self.transformer = fsdp2_prepare_model_for_optimizer(self.transformer, self.accelerator)
+        self.transformer = fsdp2_shard_model(self.transformer, self.accelerator)
 
     def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
         """Simple T2I flow-matching denoising step.
@@ -377,17 +416,10 @@ class BaseTrainer:
             device,
         )
         mask_time = [0.0]
-        if bsz > 1:
-            latent_attn = torch.ones(
-                [patched_noisy.shape[0], patched_noisy.shape[1]],
-                dtype=latents.dtype,
-                device=device,
-            )
-            attn_mask = torch.cat([prompt_attn_mask, latent_attn], dim=1)
+        if not prompt_attn_mask.all():
             mask_time = []
             with CudaTimerContext(mask_time):
-                attn_mask = create_attention_matrix(attn_mask)
-            attn_mask = attn_mask.unsqueeze(dim=1)
+                attn_mask = build_attention_mask(prompt_attn_mask, patched_noisy.shape[1], self.weight_dtype, self.args.attn_backend)
         else:
             attn_mask = None
         joint_attn_kwargs = {"attention_mask": attn_mask}
@@ -436,7 +468,7 @@ class BaseTrainer:
 
         self.accelerator.backward(loss)
         if self.accelerator.sync_gradients:
-            grad_norm = self.accelerator.clip_grad_norm_(self.transformer.parameters(), self.args.max_grad_norm)
+            grad_norm = self.clip_grad_norm(self.transformer)
             outputs.setdefault("log_extras", {})["grad_norm"] = grad_norm
         for optimizer in self.optimizer:
             optimizer.step()
@@ -482,22 +514,28 @@ class BaseTrainer:
                     logger.info(f"Rank {self.rank} reinit iterator")
                     epoch += 1
             batch = self.BATCH_CLS.from_tuple(raw_batch)
-            # Normalize the loss by the actual global batch (the resolution bucket for this
-            self.loss_coeff = WORLD_SIZE / (WORLD_SIZE * len(batch.captions))
+            # Normalize the loss by the actual per-rank batch (the resolution bucket for
+            # this step may carry a smaller batch than args.train_batch_size).
+            self.loss_coeff = 1.0 / len(batch.captions)
 
             # ----- step -----
             with self.accelerator.accumulate(self.transformer):
                 outputs = self.optimization_step(batch, fetch_time_sec=fetch_time_sec)
-                loss = outputs["loss"]
 
             # ----- per-sync admin (log, save, increment) -----
             if self.accelerator.sync_gradients:
                 progress_bar.update(1)
                 self.global_step += 1
+                loss_stats = self.reduce_loss_stats()
                 if self.accelerator.is_main_process:
-                    self.emit_wandb_log(outputs, batch_time_sec=(datetime.now(timezone.utc) - now).total_seconds())
+                    self.emit_wandb_log(outputs, loss_stats, batch_time_sec=(datetime.now(timezone.utc) - now).total_seconds())
                     now = datetime.now(timezone.utc)
                 self.reset_accumulators()
+                progress_bar.set_postfix(
+                    step_loss=loss_stats["train_loss"],
+                    global_step=self.global_step,
+                    epoch=epoch,
+                )
 
                 if self.global_step % self.args.checkpointing_steps == 0 and self.global_step > 0:
                     torch.cuda.synchronize()
@@ -509,11 +547,6 @@ class BaseTrainer:
                 if self.maybe_validate():
                     now = datetime.now(timezone.utc)
 
-            progress_bar.set_postfix(
-                step_loss=loss.detach().item(),
-                global_step=self.global_step,
-                epoch=epoch,
-            )
             if self.global_step >= self.args.max_train_steps:
                 break
 
@@ -536,25 +569,40 @@ class BaseTrainer:
     # Logging
     # ---------------------------------------------------------------
     def record_loss_components(self, outputs: dict):
-        loss = outputs["loss"]
-        self.train_loss += self.accelerator.gather(loss.detach()).mean() / self.args.gradient_accumulation_steps
+        """Accumulate loss scalars locally (no collectives, no syncs); they are averaged
+        across ranks with a single reduce per sync step in `reduce_loss_stats`."""
+        grad_acc = self.args.gradient_accumulation_steps
+        self.train_loss = self.train_loss + outputs["loss"].detach() / grad_acc
         for k, v in (outputs.get("named_losses") or {}).items():
             if v is None:
                 continue
-            tensor = v if torch.is_tensor(v) else torch.as_tensor(v)
-            gathered = self.accelerator.gather(tensor.detach().mean()).mean()
-            self.named_loss_acc[k] = self.named_loss_acc.get(k, 0.0) + gathered / self.args.gradient_accumulation_steps
+            tensor = v.detach() if torch.is_tensor(v) else torch.as_tensor(v, device=self.accelerator.device)
+            self.named_loss_acc[k] = self.named_loss_acc.get(k, 0.0) + tensor.mean() / grad_acc
 
-    def emit_wandb_log(self, outputs: dict, batch_time_sec: float):
+    def reduce_loss_stats(self) -> dict:
+        """Average the accumulated loss scalars across ranks with ONE stacked collective.
+        Collective: all ranks must call this. Keys are sorted so every rank packs the
+        tensor in the same order (the flags gating each loss are rank-uniform)."""
+        device = self.accelerator.device
+        keys = sorted(self.named_loss_acc)
+        vals = [self.train_loss] + [self.named_loss_acc[k] for k in keys]
+        packed = torch.stack([v if torch.is_tensor(v) else torch.tensor(float(v), device=device) for v in vals])
+        packed = self.accelerator.reduce(packed, reduction="mean")
+        values = packed.tolist()
+        return {"train_loss": values[0], **{f"train_{k}": v for k, v in zip(keys, values[1:])}}
+
+    def emit_wandb_log(self, outputs: dict, loss_stats: dict, batch_time_sec: float):
         def _item(v):
+            if isinstance(v, CudaTiming):
+                return float(v)
             return v.item() if hasattr(v, "item") else v
 
         log_params = {
-            "train_loss": _item(self.train_loss),
+            **loss_stats,
             "num_processes": self.accelerator.num_processes,
             "batch_time_sec": batch_time_sec,
             **{f"learning_rate_{idx}": optimizer.param_groups[0]["lr"] for idx, optimizer in enumerate(self.optimizer)},
-            **(outputs.get("timings") or {}),
+            **{k: _item(v) for k, v in (outputs.get("timings") or {}).items()},
             **{k: _item(v) for k, v in (outputs.get("log_extras") or {}).items()},
         }
         if self.flops_per_step is not None and batch_time_sec > 0:
@@ -562,8 +610,6 @@ class BaseTrainer:
             log_params["tflops_per_sec"] = achieved / 1e12
             if self.peak_flops_per_sec:
                 log_params["mfu"] = achieved / self.peak_flops_per_sec
-        for k, v in self.named_loss_acc.items():
-            log_params[f"train_{k}"] = _item(v)
         wandb.log({**log_params, **(outputs.get("wandb_extras") or {})}, step=self.global_step)
 
     def reset_accumulators(self):
@@ -731,8 +777,33 @@ class BaseTrainer:
         return int(os.path.basename(full_path).split("_")[-1])
 
     def load_checkpoint_state(self, full_path: str):
-        """Load the full accelerate state from the resume dir. Override for custom layouts."""
+        """Load the resume state. Override for custom layouts."""
+        weights_path = os.path.join(full_path, "diffusion_pytorch_model.safetensors")
+        if self.is_fsdp2() and os.path.exists(weights_path):
+            logger.info("FSDP2 resume: scattering full weights into shards (optimizer state starts fresh)")
+            fsdp2_load_full_state(self.transformer, load_file(weights_path))
+            return
         self.accelerator.load_state(full_path, map_location="cpu")
+
+    def save_full_transformer(self, save_path: str, writes: list | None = None):
+        """Gather the full student state dict (collective: all ranks enter) and write
+        safetensors + config on rank 0 — the layout ``load_checkpoint_state`` resumes
+        from. With ``writes`` the rank-0 write is appended as a closure for
+        ``write_checkpoint_async`` instead of executing here."""
+        state_dict = self.accelerator.get_state_dict(self.transformer, unwrap=False)
+        if self.accelerator.is_main_process:
+            unwrapped = self.transformer_unwrapped
+
+            def write(out_dir: str):
+                os.makedirs(out_dir, exist_ok=True)
+                unwrapped.save_config(out_dir)
+                cleaned = {k.replace("module.", "").replace("._orig_mod", ""): v.contiguous() for k, v in state_dict.items()}
+                save_file(cleaned, os.path.join(out_dir, "diffusion_pytorch_model.safetensors"))
+
+            if writes is None:
+                write(save_path)
+            else:
+                writes.append(write)
 
     def save_checkpoint(self):
         save_path = os.path.join(
@@ -753,18 +824,30 @@ class BaseTrainer:
             del state_dict
             if self.ema_student is not None:
                 self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped)
+        elif self.is_fsdp2():
+            # Manually sharded FSDP2 models are not registered with Accelerate, so
+            # save_state would silently write nothing for them. Save the gathered
+            # weights explicitly (optimizer state is not saved on this path); the
+            # multi-GB write itself lands in a background thread.
+            writes = []
+            self.save_full_transformer(save_path, writes)
+            if self.accelerator.is_main_process:
+                writes.append(self.copy_data_input_json)
+            write_checkpoint_async(save_path, writes, self.accelerator.is_main_process)
+            logger.info(f"Saving state to {save_path} in the background")
+            return
         else:
             self.accelerator.save_state(save_path)
 
         if self.accelerator.is_main_process:
-            try:
-                shutil.copyfile(
-                    self.args.json_data_input_path,
-                    os.path.join(save_path, "data_input.json"),
-                )
-            except (OSError, FileNotFoundError):
-                pass
+            self.copy_data_input_json(save_path)
         logger.info(f"Saved state to {save_path}")
+
+    def copy_data_input_json(self, out_dir: str):
+        try:
+            shutil.copyfile(self.args.json_data_input_path, os.path.join(out_dir, "data_input.json"))
+        except (OSError, FileNotFoundError):
+            pass
 
     def compute_mfu_constants(self):
         """Precompute per-step FLOPs and device peak for MFU logging.

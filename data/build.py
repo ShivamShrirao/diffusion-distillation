@@ -16,9 +16,11 @@ reuses the same preprocess / collate, so no data reads happen.
 
 import glob
 import os
+import queue
 import random
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple
+import threading
+from dataclasses import dataclass, is_dataclass
+from typing import Callable, Dict, Iterator, List, Tuple
 
 import numpy as np
 import torch
@@ -26,10 +28,13 @@ import webdataset as wds
 
 from data.json_data import ResolutionData, list_resolution_data
 from models.vae import vae_scale_factor_from_config
+from train_utils.runtime import get_logger
 
 
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 DYNAMIC_RESOLUTION_SCHEDULE_STEPS = 128
+
+logger = get_logger(__name__)
 
 
 def load_dataset_from_tars(
@@ -37,20 +42,20 @@ def load_dataset_from_tars(
     rank: int,
     world_size: int,
     seed: int = 0,
-    slice: bool = False,
+    slice_by_rank: bool = False,
     tar_files: List[str] | None = None,
 ):
     if tar_files is None:
         tar_files = []
         for train_data_dir in training_dirs:
             files = glob.glob(f"{train_data_dir}/*.tar")
-            print(f"We have {len(files)} data files on {train_data_dir}")
+            logger.info(f"We have {len(files)} data files on {train_data_dir}")
             tar_files += files
-        print(f"We have {len(tar_files)} data files in total")
+        logger.info(f"We have {len(tar_files)} data files in total")
 
     tar_files = list(tar_files)
 
-    if slice:
+    if slice_by_rank:
         all_tar_files = tar_files
         tar_files = all_tar_files[rank::world_size]
         if not tar_files and all_tar_files:
@@ -58,7 +63,7 @@ def load_dataset_from_tars(
             # splitting cannot give every rank a unique tar. Fall back to a deterministic
             # repeated shard instead of returning an empty stream.
             tar_files = [all_tar_files[rank % len(all_tar_files)]]
-            print(
+            logger.info(
                 f"Process {rank} had no sliced files for world_size={world_size}; "
                 f"reusing one shard from {len(all_tar_files)} available files"
             )
@@ -206,7 +211,7 @@ class DynamicResolutionBatchIterator:
             rank=self.rank,
             world_size=self.scheduler.world_size,
             seed=current_seed,
-            slice=True,
+            slice_by_rank=True,
             tar_files=list(bucket.tar_files),
         )
         ds = ds.shuffle(10000, rng=random.Random(current_seed))
@@ -327,10 +332,88 @@ class SyntheticBatchIterator:
         return self.collate_fn(examples, self.bucket)
 
 
+def pin_batch(batch):
+    """Recursively `pin_memory()` CPU tensors inside a collate output (tuple/list/None).
+
+    Runs on the prefetch worker thread; must NOT touch CUDA (pinning only, no `.to`).
+    Non-tensor / non-container fields (captions, resolution tuples, product names) pass
+    through unchanged, and the container type is preserved so `*Batch.from_tuple` still
+    unpacks the result identically.
+    """
+    if torch.is_tensor(batch):
+        if batch.device.type == "cpu" and not batch.is_pinned():
+            return batch.pin_memory()
+        return batch
+    if isinstance(batch, tuple):
+        return type(batch)(pin_batch(x) for x in batch) if not hasattr(batch, "_fields") else batch
+    if isinstance(batch, list):
+        return [pin_batch(x) for x in batch]
+    if is_dataclass(batch) and not isinstance(batch, type):
+        for field_name in batch.__dataclass_fields__:
+            setattr(batch, field_name, pin_batch(getattr(batch, field_name)))
+        return batch
+    return batch
+
+
+class PrefetchIterator:
+    """Overlap batch production with the training step via a background daemon thread.
+
+    Pulls batches from `inner` into a bounded queue and pins their CPU tensors, so the
+    H2D copy the consumer issues (`.to(device, non_blocking=True)`) can overlap the
+    compute of the previous step. The worker never touches CUDA. Batch ordering is
+    preserved exactly, so a `DynamicResolutionBatchIterator` yields the identical
+    sequence with prefetch on or off. Exceptions raised by `inner` are re-raised in the
+    consumer with the original traceback; `StopIteration` terminates the consumer.
+    """
+
+    STOP = object()
+
+    def __init__(self, inner: Iterator, queue_depth: int = 2):
+        self.inner = inner
+        self.queue = queue.Queue(maxsize=max(1, queue_depth))
+        self.error = None
+        self.thread = threading.Thread(target=self.worker, name="prefetch", daemon=True)
+        self.thread.start()
+
+    def worker(self):
+        try:
+            for batch in self.inner:
+                self.queue.put(pin_batch(batch))
+        except StopIteration:
+            pass
+        except BaseException as exc:  # re-raised in the consumer with original traceback
+            self.error = exc
+        finally:
+            self.queue.put(self.STOP)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is self.STOP:
+            if self.error is not None:
+                error = self.error
+                self.error = None
+                raise error.with_traceback(error.__traceback__)
+            raise StopIteration
+        return item
+
+
+def maybe_prefetch(iterator: Iterator, args) -> Iterator:
+    """Wrap `iterator` in a `PrefetchIterator` when `dataloader_num_workers >= 1`.
+
+    `dataloader_num_workers == 0` keeps today's synchronous behavior. Otherwise a single
+    background prefetch thread runs with queue depth `dataloader_num_workers + 1`.
+    """
+    num_workers = int(getattr(args, "dataloader_num_workers", 0))
+    if num_workers < 1:
+        return iterator
+    return PrefetchIterator(iterator, queue_depth=num_workers + 1)
+
+
 def build_dynamic_dataloader(args, vae_config, logger, preprocess, collate) -> Tuple[Callable, int]:
     """Wire the tar-count-weighted resolution scheduler to a builder's preprocess/collate."""
-    if args.dataloader_num_workers > 1:
-        raise ValueError("dynamic resolution buckets require dataloader_num_workers <= 1")
     rank = int(os.environ.get("RANK", 0))
     seed = args.seed + rank
     scheduler, batch_size = build_dynamic_scheduler(args, vae_config, logger)
@@ -338,12 +421,12 @@ def build_dynamic_dataloader(args, vae_config, logger, preprocess, collate) -> T
     first_bucket = scheduler.buckets[0]
     args.resolution = (first_bucket.height, first_bucket.width)
     total_batch = WORLD_SIZE * batch_size
-    print(f"Rank {rank}: dynamic resolution buckets, batch size {batch_size}, total batch {total_batch}")
+    logger.info(f"Rank {rank}: dynamic resolution buckets, batch size {batch_size}, total batch {total_batch}")
 
     def get_dataloader(start_step: int | None = None):
         if start_step is None:
             start_step = int(getattr(args, "global_step", 0)) * int(getattr(args, "gradient_accumulation_steps", 1))
-        return DynamicResolutionBatchIterator(
+        iterator = DynamicResolutionBatchIterator(
             scheduler=scheduler,
             rank=rank,
             seed=seed,
@@ -351,6 +434,7 @@ def build_dynamic_dataloader(args, vae_config, logger, preprocess, collate) -> T
             collate_fn=collate,
             start_step=start_step,
         )
+        return maybe_prefetch(iterator, args)
 
     return get_dataloader, total_batch
 
@@ -371,10 +455,10 @@ def build_random_dataloader(args, build_sample, preprocess, collate, logger) -> 
         token_count=0,
     )
     total_batch = WORLD_SIZE * bucket.batch_size
-    print(f"Rank {int(os.environ.get('RANK', 0))}: random latents, batch size {bucket.batch_size} for resolution {width}x{height}")
+    logger.info(f"Rank {int(os.environ.get('RANK', 0))}: random latents, batch size {bucket.batch_size} for resolution {width}x{height}")
 
     def get_dataloader(start_step: int | None = None):
-        return SyntheticBatchIterator(bucket, build_sample, preprocess, collate)
+        return maybe_prefetch(SyntheticBatchIterator(bucket, build_sample, preprocess, collate), args)
 
     return get_dataloader, total_batch
 
@@ -400,7 +484,7 @@ def build_dataloader_t2i(args, vae_config, logger) -> Tuple[Callable, int]:
 
     def collate(examples, bucket: BucketSpec):
         captions = [e["caption"] for e in examples]
-        pixel_values = torch.stack([e["pixel_values"] for e in examples]).to(memory_format=torch.contiguous_format).float()
+        pixel_values = torch.stack([e["pixel_values"] for e in examples])
         return pixel_values, captions, (bucket.height, bucket.width)
 
     if args.random_latents:

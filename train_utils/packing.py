@@ -43,12 +43,21 @@ def unpack_latents_no_patch(latents, height, width, vae_scale_factor):
     return latents
 
 
+LATENT_IMAGE_IDS_CACHE: dict = {}
+
+
 def prepare_latent_image_ids(batch_size, height, width, device, dtype):
-    latent_image_ids = torch.zeros(height, width, 3)
-    latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
-    latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
-    h, w, c = latent_image_ids.shape
-    return latent_image_ids.reshape(h * w, c).to(device=device, dtype=dtype)
+    """Position ids for one image, built on-device and cached per (h, w, device, dtype).
+    Ids are constant per resolution bucket; the stable tensor identity also lets the
+    transformer cache its RoPE tables. Callers must not mutate the returned tensor."""
+    key = (height, width, str(device), dtype)
+    cached = LATENT_IMAGE_IDS_CACHE.get(key)
+    if cached is None:
+        latent_image_ids = torch.zeros(height, width, 3, device=device, dtype=dtype)
+        latent_image_ids[..., 1] += torch.arange(height, device=device)[:, None]
+        latent_image_ids[..., 2] += torch.arange(width, device=device)[None, :]
+        cached = LATENT_IMAGE_IDS_CACHE[key] = latent_image_ids.reshape(height * width, 3)
+    return cached
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ import os
 import torch
 import shutil
 import wandb
-from accelerate.utils import broadcast, gather_object
+from accelerate.utils import gather_object
 from diffusers.training_utils import cast_training_params
 from safetensors.torch import load_file, save_file
 
@@ -16,7 +16,7 @@ from args.data_args import add_data_args
 from args.dmd_args import add_decoupled_dmd_args
 from data.batch import T2IBatch, get_caption_short_description
 from data.build import build_dataloader_t2i
-from distributed import compile_transformer, fsdp2_prepare_model_for_optimizer
+from distributed import compile_transformer, fsdp2_set_reshard_after_forward, fsdp2_shard_model
 from lora.adapters import LORA_TARGET_MODULES
 from lora.static_multi_lora import (
     inject_multi_lora,
@@ -25,12 +25,11 @@ from lora.static_multi_lora import (
     save_peft_adapter,
 )
 from train_utils.ema import FullFtEMA, LoraEMA
-from train_utils.checkpoint import resolve_resume_checkpoint
-from train_utils.lr_scheduler import build_lr_scheduler
+from train_utils.checkpoint import resolve_resume_checkpoint, write_checkpoint_async
 from train_utils.packing import pack_t2i
 from train_utils.runtime import CudaTimerContext
 from losses.dmd import compute_decoupled_dmd_loss, compute_fake_score_loss
-from models.text_encoder import create_attention_matrix
+from train_utils.attention import build_attention_mask, diffusers_backend_name
 from models.transformer import Fibo2Transformer2DModel, build_transformer_config
 from models.vae import build_vae, decode_to_images
 from schedulers.flow_matching import build_infer_scheduler, build_infer_timesteps
@@ -61,6 +60,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.ema_student = None
 
     def extra_setup(self):
+        # Rank-uniform CPU RNG for per-step choices every rank must agree on (K, grad step).
+        # Seeded from the base seed (NOT the per-rank seed): no collective, no device sync.
+        self.shared_rng = torch.Generator().manual_seed(self.args.seed)
         self.infer_scheduler = build_infer_scheduler()
         if self.args.dmd_log_image_every > 0 or self.args.validate_every > 0:
             self.vae = build_vae(self.args, self.accelerator, self.weight_dtype)
@@ -111,7 +113,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.fake_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
             self.real_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
 
-        if (args.use_fsdp and self.accelerator.is_main_process) or (not args.use_fsdp):
+        if not args.use_fsdp or self.accelerator.is_main_process:
             src_sd = self.transformer.state_dict()
             self.real_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
             self.fake_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
@@ -125,6 +127,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         self.fake_transformer.requires_grad_(True)
         self.real_transformer.requires_grad_(False)
+        if self.args.attn_backend != "native":
+            self.fake_transformer.set_attention_backend(diffusers_backend_name(self.args.attn_backend))
+            self.real_transformer.set_attention_backend(diffusers_backend_name(self.args.attn_backend))
 
         if args.gradient_checkpointing:
             self.fake_transformer.enable_gradient_checkpointing()
@@ -138,10 +143,10 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         logger.info(f"Full-FT student trainable params: {n_trainable:,} / {n_total:,}")
 
     def shard_trainable_models(self):
-        self.transformer = fsdp2_prepare_model_for_optimizer(self.transformer, self.accelerator)
+        self.transformer = fsdp2_shard_model(self.transformer, self.accelerator)
         if self.args.lora_rank == 0:
-            self.fake_transformer = fsdp2_prepare_model_for_optimizer(self.fake_transformer, self.accelerator)
-            self.real_transformer = fsdp2_prepare_model_for_optimizer(self.real_transformer, self.accelerator)
+            self.fake_transformer = fsdp2_shard_model(self.fake_transformer, self.accelerator)
+            self.real_transformer = fsdp2_shard_model(self.real_transformer, self.accelerator)
 
     def build_optimizer(self):
         if self.args.lora_rank == 0:
@@ -159,31 +164,11 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                     fake_params.append(param)
 
         fake_lr = self.args.fake_lr if self.args.fake_lr is not None else self.args.learning_rate
-        student_optimizer = torch.optim.AdamW(
-            student_params,
-            lr=self.args.learning_rate,
-            betas=(self.args.adam_beta1, self.args.adam_beta2),
-            weight_decay=self.args.adam_weight_decay,
-            eps=self.args.adam_epsilon,
-            fused=not bool(self.args.use_fsdp),
-            foreach=False if self.args.use_fsdp else None,
-        )
-        fake_optimizer = torch.optim.AdamW(
-            fake_params,
-            lr=fake_lr,
-            betas=(self.args.adam_beta1, self.args.adam_beta2),
-            weight_decay=self.args.adam_weight_decay,
-            eps=self.args.adam_epsilon,
-            fused=not bool(self.args.use_fsdp),
-            foreach=False if self.args.use_fsdp else None,
-        )
+        adamw_kwargs = self.adamw_kwargs()
+        student_optimizer = torch.optim.AdamW(student_params, lr=self.args.learning_rate, **adamw_kwargs)
+        fake_optimizer = torch.optim.AdamW(fake_params, lr=fake_lr, **adamw_kwargs)
         self.optimizer = [student_optimizer, fake_optimizer]
-        # Accelerate-wrapped schedulers step once per process; raw FSDP2 schedulers step once.
-        scheduler_step_multiplier = 1 if self.is_fsdp2() else self.accelerator.num_processes
-        self.lr_scheduler = [
-            build_lr_scheduler(self.args, student_optimizer, scheduler_step_multiplier),
-            build_lr_scheduler(self.args, fake_optimizer, scheduler_step_multiplier),
-        ]
+        self.lr_scheduler = [self.build_scheduler(student_optimizer), self.build_scheduler(fake_optimizer)]
 
     def post_optimizer_setup(self):
         if self.args.lora_rank > 0 and self.args.ema_decay > 0:
@@ -202,13 +187,6 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, regional=self.args.regional_compile)
             compile_transformer(self.real_transformer, self.real_transformer_unwrapped, regional=self.args.regional_compile)
 
-    def _clip_grad_norm(self, model):
-        if self.args.use_fsdp and self.args.lora_rank == 0 and hasattr(model, "clip_grad_norm_"):
-            return model.clip_grad_norm_(self.args.max_grad_norm)
-        if self.is_fsdp2():
-            return torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
-        return self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
-
     @staticmethod
     def _stash_optimizer_grads(optimizer):
         stashed = []
@@ -223,47 +201,44 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         for param, grad in stashed:
             param.grad = grad
 
-    def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
+    def prepare_dmd_step(self, batch: T2IBatch) -> dict:
+        """Shared step prologue for the DMD trainers: conditioning, packing, attention
+        mask, per-step K / timestep grid, and initial noise. The trainer-specific rollout
+        in ``training_step`` consumes the returned dict."""
         height, width = batch.resolution or self.args.resolution
         device = self.accelerator.device
 
         eh, te_layers, prompt_attn_mask, text_encoder_time = self.run_text_encoder(batch.captions)
-        pixel_values = batch.pixel_values.to(device=device, dtype=torch.float32)
-        eh = eh.to(device=device, dtype=torch.float32)
-        prompt_attn_mask = prompt_attn_mask.to(device=device, dtype=torch.float32)
+        pixel_values = batch.pixel_values.to(device=device, dtype=torch.float32, non_blocking=True)
+        # Conditioning in the compute dtype up front: the loss helpers' .to(model_dtype)
+        # casts (~60 tensors per call site) become no-ops.
+        eh = eh.to(device=device, dtype=self.weight_dtype)
+        prompt_attn_mask = prompt_attn_mask.to(device=device, dtype=self.weight_dtype)
 
         latents = (pixel_values - self.vae_config["shift_factor"]) * self.vae_config["scaling_factor"]
 
-        bsz = pixel_values.shape[0]
-        num_text_tokens = eh.shape[1]
 
         patched_latents, patched_image_ids = pack_t2i(latents, height, width, self.vae_scale_factor, self.args.do_patching, device)
         latents_seq_len = patched_latents.shape[1]
         mask_time = [0.0]
-        if bsz > 1:
-            latent_attn = torch.ones([bsz, latents_seq_len], dtype=latents.dtype, device=device)
-            attn_mask = torch.cat([prompt_attn_mask, latent_attn], dim=1)
+        if not prompt_attn_mask.all():
             mask_time = []
             with CudaTimerContext(mask_time):
-                attn_mask = create_attention_matrix(attn_mask)
-            attn_mask = attn_mask.unsqueeze(dim=1)
+                attn_mask = build_attention_mask(prompt_attn_mask, latents_seq_len, self.weight_dtype, self.args.attn_backend)
         else:
             attn_mask = None
         joint_attn_kwargs = {"attention_mask": attn_mask}
         if self.args.lora_rank > 0:
-            joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer, device=device)
+            joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer)
 
-        # TDM steps-aware: sample the step-count K per iteration (broadcast so FSDP ranks agree).
+        # TDM steps-aware: sample the step-count K per iteration (shared RNG so FSDP ranks agree).
         num_inference_steps = self.args.dmd_num_inference_steps
         if self.args.tdm_step_list:
             k_choices = [int(x) for x in self.args.tdm_step_list.split(",") if x.strip()]
-            k_sel = broadcast(torch.randint(0, len(k_choices), (1,), device=device, dtype=torch.long), from_process=0)
-            num_inference_steps = k_choices[int(k_sel.item())]
+            num_inference_steps = k_choices[int(torch.randint(0, len(k_choices), (1,), generator=self.shared_rng).item())]
         infer_timesteps = build_infer_timesteps(self.infer_scheduler, num_inference_steps, latents_seq_len, device, mu=self.args.dmd_mu)
 
         generated_latents = torch.randn(patched_latents.shape, device=device, dtype=patched_latents.dtype, generator=self.generator)
-
-        current_null_embeds, current_null_layers = self.null_conditioning_for(bsz, num_text_tokens)
 
         do_gen_update = (self.global_step + 1) % self.args.dfake_gen_update_ratio == 0
 
@@ -274,46 +249,120 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             attn_kwargs=joint_attn_kwargs,
             latents_seq_len=latents_seq_len,
         )
+        return dict(
+            height=height,
+            width=width,
+            device=device,
+            eh=eh,
+            te_layers=te_layers,
+            patched_latents=patched_latents,
+            patched_image_ids=patched_image_ids,
+            joint_attn_kwargs=joint_attn_kwargs,
+            infer_timesteps=infer_timesteps,
+            num_inference_steps=num_inference_steps,
+            generated_latents=generated_latents,
+            do_gen_update=do_gen_update,
+            gen_kwargs=gen_kwargs,
+            text_encoder_time=text_encoder_time,
+            mask_time=mask_time,
+        )
+
+    def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
+        prep = self.prepare_dmd_step(batch)
+        device = prep["device"]
+        infer_timesteps, gen_kwargs = prep["infer_timesteps"], prep["gen_kwargs"]
+        generated_latents, do_gen_update = prep["generated_latents"], prep["do_gen_update"]
+        patched_latents = prep["patched_latents"]
 
         generate_time = []
         with CudaTimerContext(generate_time):
-            selected_step = torch.randint(low=0, high=len(infer_timesteps), size=(1,), device=device, dtype=torch.long)
-            selected_step = broadcast(selected_step, from_process=0)
-            grad_step_idx = int(selected_step.item())
+            if self.args.tdm_segment_renoise:
+                bsz = generated_latents.shape[0]
+                num_steps = len(infer_timesteps)
+                # Official TDM: full no-grad rollout, one random segment per SAMPLE. Fixed-size
+                # CPU draw keeps shared_rng in rank lockstep regardless of bsz.
+                seg_idx = torch.randint(0, num_steps, (64,), generator=self.shared_rng)[:bsz]
+                idx_dev = seg_idx.to(device)
+                t_vec = infer_timesteps[idx_dev]  # (B,) per-sample grad timesteps
+                # Full-length rollout: forward count must match across ranks (FSDP2 collectives).
+                n_roll = num_steps - 1
+                hold_unsharded = n_roll > 1 and self.is_fsdp2()
+                if hold_unsharded:
+                    fsdp2_set_reshard_after_forward(self.transformer, False)
+                try:
+                    with torch.no_grad():
+                        traj_inputs = [generated_latents]  # traj_inputs[i] = latent fed into step i
+                        for t in infer_timesteps[:n_roll]:
+                            pred = predict_flow_step(self.transformer, generated_latents, t, **gen_kwargs)
+                            generated_latents = self.infer_scheduler.step(pred, t, generated_latents, return_dict=False)[0]
+                            traj_inputs.append(generated_latents)
+                finally:
+                    if hold_unsharded:
+                        fsdp2_set_reshard_after_forward(self.transformer, True, reshard_now=True)
+                # Gather each sample's rollout input at its segment.
+                stacked = torch.stack(traj_inputs)
+                gen_input = stacked[idx_dev, torch.arange(bsz, device=device)]
 
-            with torch.no_grad():
-                for t in infer_timesteps[:grad_step_idx]:
-                    pred = predict_flow_step(self.transformer, generated_latents, t, **gen_kwargs)
-                    generated_latents = self.infer_scheduler.step(pred, t, generated_latents, return_dict=False)[0]
+                with torch.set_grad_enabled(do_gen_update):
+                    pred = predict_flow_step(self.transformer, gen_input, t_vec, **gen_kwargs)
+                gen_v = pred.detach()
+                sigma = (t_vec.float() / 1000.0).view(-1, 1, 1).to(device=device, dtype=gen_input.dtype)
+                generated_latents = gen_input - sigma * pred
+                dmd_latents = generated_latents
 
-            t_grad = infer_timesteps[grad_step_idx]
-            with torch.set_grad_enabled(do_gen_update):
-                pred = predict_flow_step(self.transformer, generated_latents, t_grad, **gen_kwargs)
-            sigma = (t_grad.float() / 1000.0).to(device=device, dtype=generated_latents.dtype)
-            generated_latents = generated_latents - sigma * pred
-            dmd_latents = generated_latents
+                # Per-sample segment bounds (seg_lo = 0 on the last step).
+                infer_ext = torch.cat([infer_timesteps.float(), infer_timesteps.new_zeros(1, dtype=torch.float32)])
+                seg_hi = infer_ext[idx_dev]
+                seg_lo = infer_ext[idx_dev + 1]
+                grad_step_idx = seg_idx.float().mean().item()
+            else:
+                grad_step_idx = int(torch.randint(0, len(infer_timesteps), (1,), generator=self.shared_rng).item())
+                t_grad = infer_timesteps[grad_step_idx]
 
-        # TDM segment: the selected step covers [seg_lo, seg_hi] in noise_max_t units (seg_lo=0 on the last step).
-        seg_hi = float(infer_timesteps[grad_step_idx])
-        seg_lo = float(infer_timesteps[grad_step_idx + 1]) if grad_step_idx + 1 < len(infer_timesteps) else 0.0
+                # Keep the student's params gathered across the multi-forward rollout
+                # instead of re-all-gathering the full model every step; weights don't
+                # change inside the loop, and we reshard before the grad forward.
+                hold_unsharded = grad_step_idx > 1 and self.is_fsdp2()
+                if hold_unsharded:
+                    fsdp2_set_reshard_after_forward(self.transformer, False)
+                try:
+                    with torch.no_grad():
+                        for t in infer_timesteps[:grad_step_idx]:
+                            pred = predict_flow_step(self.transformer, generated_latents, t, **gen_kwargs)
+                            generated_latents = self.infer_scheduler.step(pred, t, generated_latents, return_dict=False)[0]
+                finally:
+                    if hold_unsharded:
+                        fsdp2_set_reshard_after_forward(self.transformer, True, reshard_now=True)
+
+                with torch.set_grad_enabled(do_gen_update):
+                    pred = predict_flow_step(self.transformer, generated_latents, t_grad, **gen_kwargs)
+                gen_v = None
+                sigma = (t_grad.float() / 1000.0).to(device=device, dtype=generated_latents.dtype)
+                generated_latents = generated_latents - sigma * pred
+                dmd_latents = generated_latents
+
+        if not self.args.tdm_segment_renoise:
+            # TDM segment: the selected step covers [seg_lo, seg_hi] in noise_max_t units (seg_lo=0 on the last step).
+            seg_hi = float(infer_timesteps[grad_step_idx])
+            seg_lo = float(infer_timesteps[grad_step_idx + 1]) if grad_step_idx + 1 < len(infer_timesteps) else 0.0
 
         return {
-            "image": [height, width, device],
-            "cond": [eh, te_layers, patched_image_ids, joint_attn_kwargs],
-            "null": [current_null_embeds, current_null_layers],
+            "image": [prep["height"], prep["width"], device],
+            "cond": [prep["eh"], prep["te_layers"], prep["patched_image_ids"], prep["joint_attn_kwargs"]],
             "rollout": [dmd_latents, do_gen_update, grad_step_idx],
             "real_latents": patched_latents,
-            "tdm": [num_inference_steps, seg_lo, seg_hi],
-            "timings": [text_encoder_time, generate_time[0], mask_time[0], fetch_time_sec],
+            "gen_v": gen_v,
+            "tdm": [prep["num_inference_steps"], seg_lo, seg_hi],
+            "timings": [prep["text_encoder_time"], generate_time[0], prep["mask_time"][0], fetch_time_sec],
         }
 
     def optimization_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
         setup = self.training_step(batch, fetch_time_sec=fetch_time_sec)
         height, width, device = setup["image"]
         eh, te_layers, patched_image_ids, joint_attn_kwargs = setup["cond"]
-        current_null_embeds, current_null_layers = setup["null"]
         dmd_latents, do_gen_update, grad_step_idx = setup["rollout"]
         _, seg_lo, seg_hi = setup.get("tdm", [self.args.dmd_num_inference_steps, None, None])
+        gen_v = setup.get("gen_v")
         text_encoder_time, generate_time, mask_time, fetch_time_sec = setup["timings"]
         student_optimizer, fake_optimizer = self.optimizer[0], self.optimizer[1]
         student_lr_scheduler, fake_lr_scheduler = self.lr_scheduler[0], self.lr_scheduler[1]
@@ -327,8 +376,14 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         fake_module = self.transformer if self.args.lora_rank > 0 else self.fake_transformer
         # 1) Student update — DMD loss (internal fake DM fwd + real teacher fwd).
         if do_gen_update:
+            # Only the gen-update losses consume the null (uncond) embeddings; cached, so
+            # the ~60-tensor pad+repeat runs once per (bsz, text-len, dtype) bucket.
+            current_null_embeds, current_null_layers = self.null_conditioning_for(
+                eh.shape[0], eh.shape[1], dtype=self.weight_dtype
+            )
             dmd_outputs = compute_decoupled_dmd_loss(
                 generated_latents=dmd_latents,
+                generated_v=gen_v,
                 seg_lo=seg_lo,
                 seg_hi=seg_hi,
                 real_transformer=real_module,
@@ -354,7 +409,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             if self.accelerator.sync_gradients:
                 if self.args.lora_rank > 0:
                     fake_grad_stash = self._stash_optimizer_grads(fake_optimizer)
-                student_grad_norm = self._clip_grad_norm(self.transformer)
+                student_grad_norm = self.clip_grad_norm(self.transformer)
             student_optimizer.step()
             student_optimizer.zero_grad()
             if self.accelerator.sync_gradients and self.ema_student is not None and self.global_step >= self.args.ema_start_step:
@@ -382,6 +437,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             model_dtype=self.weight_dtype,
             seg_lo=seg_lo,
             seg_hi=seg_hi,
+            generated_v=gen_v,
             args=self.args,
         )
         fake_loss = fake_outputs["loss"]
@@ -395,7 +451,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         fake_grad_norm = None
         if self.accelerator.sync_gradients:
-            fake_grad_norm = self._clip_grad_norm(fake_module)
+            fake_grad_norm = self.clip_grad_norm(fake_module)
         fake_optimizer.step()
         fake_lr_scheduler.step()
         fake_optimizer.zero_grad()
@@ -451,8 +507,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self._save_full_ft_checkpoint(save_path)
         else:
             self._save_lora_checkpoint(save_path)
+            logger.info(f"Saved state to {save_path}")
         self.accelerator.wait_for_everyone()
-        logger.info(f"Saved state to {save_path}")
 
     def _save_lora_checkpoint(self, save_path: str):
         logger.info(f"Saving static DMD LoRA checkpoint to {save_path}")
@@ -469,28 +525,32 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped)
 
     def _save_full_ft_checkpoint(self, save_path: str):
-        logger.info(f"Saving full-FT DMD checkpoint to {save_path}")
+        """Gather student/fake/EMA state dicts (collectives: every rank enters), then
+        hand the rank-0 writes to the async checkpoint writer."""
+        logger.info(f"Saving full-FT DMD checkpoint to {save_path} (background write)")
+        writes = []
         student_sd = self.accelerator.get_state_dict(self.transformer, unwrap=False)
         fake_sd = self.accelerator.get_state_dict(self.fake_transformer, unwrap=False)
         if self.accelerator.is_main_process:
-            for sub, sd, unwrapped in (
-                ("student", student_sd, self.transformer_unwrapped),
-                ("fake", fake_sd, self.fake_transformer_unwrapped),
-            ):
-                sub_dir = os.path.join(save_path, sub)
-                os.makedirs(sub_dir, exist_ok=True)
-                unwrapped.save_config(sub_dir)
-                cleaned = {k.replace("module.", "").replace("._orig_mod", ""): v.contiguous() for k, v in sd.items()}
-                save_file(cleaned, os.path.join(sub_dir, "diffusion_pytorch_model.safetensors"))
-                del cleaned
-            try:
-                shutil.copyfile(self.args.json_data_input_path, os.path.join(save_path, "data_input.json"))
-            except (OSError, FileNotFoundError):
-                pass
-        del student_sd, fake_sd
+
+            def write_models(out_dir: str):
+                for sub, sd, unwrapped in (
+                    ("student", student_sd, self.transformer_unwrapped),
+                    ("fake", fake_sd, self.fake_transformer_unwrapped),
+                ):
+                    sub_dir = os.path.join(out_dir, sub)
+                    os.makedirs(sub_dir, exist_ok=True)
+                    unwrapped.save_config(sub_dir)
+                    cleaned = {k.replace("module.", "").replace("._orig_mod", ""): v.contiguous() for k, v in sd.items()}
+                    save_file(cleaned, os.path.join(sub_dir, "diffusion_pytorch_model.safetensors"))
+                    del cleaned
+                self.copy_data_input_json(out_dir)
+
+            writes.append(write_models)
 
         if self.ema_student is not None:
-            self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped)
+            self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped, writes=writes)
+        write_checkpoint_async(save_path, writes, self.accelerator.is_main_process)
 
     @torch.no_grad()
     def _build_image_logs(
@@ -581,12 +641,10 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         latents, img_ids = pack_t2i(noise, height, width, self.vae_scale_factor, self.args.do_patching, device)
         latents_seq_len = latents.shape[1]
 
-        latent_attn = torch.ones([1, latents_seq_len], dtype=latents.dtype, device=device)
-        attn_mask = torch.cat([prompt_attn_mask, latent_attn], dim=1)
-        attn_mask = create_attention_matrix(attn_mask).unsqueeze(dim=1).to(self.weight_dtype)
+        attn_mask = build_attention_mask(prompt_attn_mask, latents_seq_len, self.weight_dtype, self.args.attn_backend)
         joint_attn_kwargs = {"attention_mask": attn_mask}
         if self.args.lora_rank > 0:
-            joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer, device=device)
+            joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer)
 
         gen_kwargs = dict(
             encoder_hidden_states=eh,

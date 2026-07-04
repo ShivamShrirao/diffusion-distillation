@@ -11,11 +11,11 @@ magnitude (DMD2 weighting trick); the CA gradient direction is
 `(rgs - 1) * (x0_real_cond - x0_real_uncond)` normalised the same way.
 
 Active LoRA adapter per forward is selected via an explicit
-`lora_scales` tensor passed through `joint_attention_kwargs`. The
-transformer's checkpoint wrapper threads this tensor through the
-gradient-checkpoint boundary so backward recompute uses the same scales as
-the original forward (mutating module state between forward and backward
-would otherwise corrupt the recomputed activations).
+`lora_scales` tuple of floats passed through `joint_attention_kwargs`. The
+transformer's checkpoint wrapper threads it through the gradient-checkpoint
+boundary so backward recompute uses the same scales as the original forward
+(mutating module state between forward and backward would otherwise corrupt
+the recomputed activations).
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from lora.static_multi_lora import StaticMultiLoraLinear, make_scales
+from train_utils.attention import replicate_attention_mask
 
 
 def add_flow_noise(x0: torch.Tensor, timesteps: torch.Tensor, noise_max_t: int) -> torch.Tensor:
@@ -36,19 +37,39 @@ def x0_from_v(noisy: torch.Tensor, pred_v: torch.Tensor, timesteps: torch.Tensor
     return noisy - sigmas * pred_v
 
 
+def add_segment_bridge_noise(
+    x0: torch.Tensor, v: torch.Tensor, seg_lo: torch.Tensor, timesteps: torch.Tensor, noise_max_t: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """TDM boundary-anchored renoise: deterministic to the segment's lower boundary (ODE point
+    z_lo = x0 + sigma_lo * v), then forward-diffused to `timesteps`. Returns (noisy, target_v);
+    seg_lo = 0 reduces to plain fresh-noise renoise of x0."""
+    sigma_lo = (seg_lo.float() / noise_max_t).view(-1, 1, 1).to(device=x0.device, dtype=x0.dtype)
+    sigma_t = (timesteps.float() / noise_max_t).view(-1, 1, 1).to(device=x0.device, dtype=x0.dtype)
+    fresh = torch.randn_like(x0)
+    z_lo = x0 + sigma_lo * v
+    a = (1.0 - sigma_t) / (1.0 - sigma_lo).clamp(min=1e-6)
+    beta = (sigma_t.square() - (a * sigma_lo).square()).clamp(min=0.0).sqrt()
+    noisy = a * z_lo + beta * fresh
+    eps_mix = torch.where(
+        sigma_t > 0, (a * sigma_lo * (v + x0) + beta * fresh) / sigma_t.clamp(min=1e-8), fresh
+    )
+    return noisy, eps_mix - x0
+
+
 def replicate_attn_mask(attn_kwargs: dict, n: int) -> dict:
     out = dict(attn_kwargs or {})
     am = out.get("attention_mask")
-    if torch.is_tensor(am):
-        out["attention_mask"] = torch.cat([am] * n, dim=0)
+    if am is not None:
+        out["attention_mask"] = replicate_attention_mask(am, n)
     return out
 
 
 def compute_decoupled_dmd_loss(
     *,
     generated_latents: torch.Tensor,
-    seg_lo: float | None = None,
-    seg_hi: float | None = None,
+    generated_v: torch.Tensor | None = None,  # detached student velocity; enables TDM bridge renoise
+    seg_lo: float | torch.Tensor | None = None,
+    seg_hi: float | torch.Tensor | None = None,
     real_transformer,
     fake_transformer,
     cond_hidden_states: torch.Tensor,
@@ -63,19 +84,20 @@ def compute_decoupled_dmd_loss(
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
     use_lora_scales = real_transformer is fake_transformer
-    fake_scales = make_scales("fake", fake_transformer, device=device) if use_lora_scales else None
-    disabled_scales = make_scales(None, real_transformer, device=device) if use_lora_scales else None
+    fake_scales = make_scales("fake", fake_transformer) if use_lora_scales else None
+    disabled_scales = make_scales(None, real_transformer) if use_lora_scales else None
 
     with torch.no_grad():
         # seg_hi == t_grad == infer_timesteps[grad_step_idx]; the old linspace+logit+sigmoid
         # recomputed exactly that flow-match time-shift, so use the rollout timestep directly.
         if getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None:
-            # TDM: CA (CFG anchor) and DM (distribution matching) both renoise within the
-            # selected step's segment [seg_lo, seg_hi], so each step specializes on its segment.
-            u_ca = torch.rand(batch_size, device=device)
-            ca_timesteps = (seg_lo + u_ca * (seg_hi - seg_lo)).long().clamp(min=0, max=args.noise_max_t - 1)
-            u_dm = torch.rand(batch_size, device=device)
-            dm_timesteps = (seg_lo + u_dm * (seg_hi - seg_lo)).long().clamp(min=0, max=args.noise_max_t - 1)
+            # TDM: CA + DM renoise uniformly within the segment.
+            lo_sigma = torch.as_tensor(seg_lo, device=device, dtype=torch.float32) / args.noise_max_t
+            hi_sigma = torch.as_tensor(seg_hi, device=device, dtype=torch.float32) / args.noise_max_t
+            ca_sigmas = lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma)
+            ca_timesteps = (ca_sigmas * args.noise_max_t).long().clamp(min=0, max=args.noise_max_t - 1)
+            dm_sigmas = lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma)
+            dm_timesteps = (dm_sigmas * args.noise_max_t).long().clamp(min=0, max=args.noise_max_t - 1)
         else:
             # Non-TDM: CA = uniform in (0, gen_sigma]; DM = global uniform.
             gen_sigma = torch.tensor(seg_hi / args.noise_max_t, device=device)
@@ -84,8 +106,14 @@ def compute_decoupled_dmd_loss(
             ca_timesteps = (ca_sigmas * args.noise_max_t).long().clamp(max=ca_upper)
             dm_timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
 
-        ca_noisy = add_flow_noise(generated_latents, ca_timesteps, args.noise_max_t)
-        dm_noisy = add_flow_noise(generated_latents, dm_timesteps, args.noise_max_t)
+        tdm_renoise = getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None
+        if tdm_renoise and generated_v is not None:
+            seg_lo_t = lo_sigma * args.noise_max_t
+            ca_noisy, _ = add_segment_bridge_noise(generated_latents, generated_v, seg_lo_t, ca_timesteps, args.noise_max_t)
+            dm_noisy, _ = add_segment_bridge_noise(generated_latents, generated_v, seg_lo_t, dm_timesteps, args.noise_max_t)
+        else:
+            ca_noisy = add_flow_noise(generated_latents, ca_timesteps, args.noise_max_t)
+            dm_noisy = add_flow_noise(generated_latents, dm_timesteps, args.noise_max_t)
 
         cond_h = cond_hidden_states.to(dtype=model_dtype)
         uncond_h = uncond_hidden_states.to(dtype=model_dtype)
@@ -176,28 +204,34 @@ def compute_fake_score_loss(
     img_ids: torch.Tensor,
     attn_kwargs: dict,
     model_dtype: torch.dtype,
-    seg_lo: float | None = None,
-    seg_hi: float | None = None,
+    seg_lo: float | torch.Tensor | None = None,
+    seg_hi: float | torch.Tensor | None = None,
+    generated_v: torch.Tensor | None = None,  # detached student velocity; enables TDM bridge renoise
     args=None,
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
     use_lora_scales = any(isinstance(sub, StaticMultiLoraLinear) for sub in transformer.modules())
-    fake_scales = make_scales("fake", transformer, device=device) if use_lora_scales else None
+    fake_scales = make_scales("fake", transformer) if use_lora_scales else None
+    clean_latents = generated_latents.detach()
 
     # --- fake-score renoise timestep ---
     if getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None:
         # TDM segment matching: train the fake score within the selected step's segment.
+        lo = torch.as_tensor(seg_lo, device=device, dtype=torch.float32)
+        hi = torch.as_tensor(seg_hi, device=device, dtype=torch.float32)
         u = torch.rand(batch_size, device=device)
-        timesteps = (seg_lo + u * (seg_hi - seg_lo)).long().clamp(min=0, max=args.noise_max_t - 1)
+        timesteps = (lo + u * (hi - lo)).long().clamp(min=0, max=args.noise_max_t - 1)
     else:
         # uniform (global):
         timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
-    clean_latents = generated_latents.detach()
-    noise = torch.randn_like(clean_latents)
-    sigmas = (timesteps.float() / args.noise_max_t).view(-1, 1, 1).to(device=device, dtype=clean_latents.dtype)
-    noisy_latents = sigmas * noise + (1.0 - sigmas) * clean_latents
-    target_v = noise - clean_latents
+    if getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None and generated_v is not None:
+        noisy_latents, target_v = add_segment_bridge_noise(clean_latents, generated_v.detach(), lo, timesteps, args.noise_max_t)
+    else:
+        noise = torch.randn_like(clean_latents)
+        sigmas = (timesteps.float() / args.noise_max_t).view(-1, 1, 1).to(device=device, dtype=clean_latents.dtype)
+        noisy_latents = sigmas * noise + (1.0 - sigmas) * clean_latents
+        target_v = noise - clean_latents
 
     noisy_latents = noisy_latents.to(dtype=model_dtype)
     fake_attn_kwargs = {**(attn_kwargs or {})}

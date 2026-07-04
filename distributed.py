@@ -11,7 +11,12 @@ import diffusers
 import torch
 import transformers
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
-from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs, ProjectConfiguration
+from accelerate.utils import (
+    DistributedDataParallelKwargs,
+    InitProcessGroupKwargs,
+    ProjectConfiguration,
+    disable_fsdp_ram_efficient_loading,
+)
 from huggingface_hub import login
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -36,7 +41,6 @@ def build_accelerator(args, weight_dtype):
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     fsdp_plugin = None
     if args.use_fsdp:
-        os.environ["ACCELERATE_USE_FSDP"] = "true"
         # cuDNN SDPA backward returns NaN at head_dim=128/bf16 on FSDP2's all-gathered
         # tensors (FSDP1 didn't select it); fall back to flash/mem-efficient.
         torch.backends.cuda.enable_cudnn_sdp(False)
@@ -65,9 +69,11 @@ def build_accelerator(args, weight_dtype):
         kwargs_handlers=kwargs_handlers,
     )
     if fsdp_plugin is not None:
-        # Keep Accelerate's FSDP2 prepare path CPU-RAM-efficient via the plugin, but do not
-        # let later Transformers.from_pretrained calls load rank-0-only placeholders.
-        os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "False"
+        # The plugin exports FSDP_CPU_RAM_EFFICIENT_LOADING=True, which makes every later
+        # transformers.from_pretrained load rank-0-only placeholders — wrong for models that
+        # are never FSDP-sharded (text encoder, rewards). Turn the env flag back off; the
+        # plugin attribute stays True so fsdp2_shard_model still scatters rank-0 weights.
+        disable_fsdp_ram_efficient_loading()
 
     with accelerator.main_process_first():
         if accelerator.is_local_main_process and os.environ.get("HF_API_TOKEN"):
@@ -133,12 +139,33 @@ def fsdp2_shard_frozen(model, accelerator, wrap_classes, *, param_dtype=torch.bf
     return model
 
 
-def fsdp2_prepare_model_for_optimizer(model, accelerator, *, transformer_cls_names_to_wrap=None):
-    """FSDP2-shard a model before optimizer construction.
+def fsdp2_set_reshard_after_forward(model, value: bool, *, reshard_now: bool = False):
+    """Toggle FSDP2 post-forward resharding on every FSDP submodule; no-op for
+    unsharded models. Turning it off around a multi-forward no-grad loop (the DMD
+    rollout) keeps params gathered instead of re-all-gathering the whole model on every
+    forward. Turn it back on before any weight update or grad forward —
+    ``reshard_now=True`` frees the gathered params immediately. While resharding is off,
+    weight updates would NOT propagate to the cached unsharded params, so only use this
+    around loops that don't touch weights."""
+    from torch.distributed.fsdp import FSDPModule
 
-    Optimizers built after this point already point at the live FSDP2 parameters, so we avoid
-    Accelerate's optimizer parameter remapping path.
-    """
+    for m in model.modules():
+        if isinstance(m, FSDPModule):
+            m.set_reshard_after_forward(value)
+            if reshard_now:
+                m.reshard()
+
+
+def fsdp2_shard_model(model, accelerator, *, transformer_cls_names_to_wrap=None):
+    """FSDP2-shard a model in place with the plugin's policy (rank-0 weights are scattered
+    to all ranks via ``cpu_ram_efficient_loading``); no-op without FSDP2.
+
+    Used for every same-arch transformer (student/fake/real), instead of
+    ``accelerator.prepare``: prepare() only supports one model+optimizer per call and remaps
+    optimizer params afterwards, which doesn't fit DMD's multi-model / frozen-teacher setup.
+    Trainable models must be sharded BEFORE their optimizer is built so the optimizer holds
+    the live DTensor params. ``transformer_cls_names_to_wrap`` overrides the plugin's block
+    classes for this call ([] = shard the root only)."""
     plugin = getattr(accelerator.state, "fsdp_plugin", None)
     if plugin is None or getattr(plugin, "fsdp_version", None) != 2:
         return model
@@ -156,11 +183,24 @@ def fsdp2_prepare_model_for_optimizer(model, accelerator, *, transformer_cls_nam
         plugin.transformer_cls_names_to_wrap = original_transformer_cls_names_to_wrap
 
 
+def fsdp2_load_full_state(model, full_sd: dict):
+    """Load a full (unsharded) state dict into a live FSDP2-sharded model. Every rank
+    passes the full sd it loaded and DCP takes the rank's own shard of each tensor."""
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    set_model_state_dict(
+        model,
+        full_sd,
+        options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=False, strict=False),
+    )
+
+
 def compile_transformer(transformer, transformer_unwrapped, regional: bool = False, **compile_kwargs):
     """Compile the transformer in-place.
 
-    `regional=True` compiles each transformer block individually (cheaper recompile on
-    shape changes); otherwise the full module is compiled.
+    `regional=True` compiles each block runner individually (cheaper recompile on shape
+    changes, checkpoint kept inside the compiled region — see build_block_runners);
+    otherwise the full module is compiled.
     """
     torch._dynamo.config.recompile_limit = 64
     if regional:

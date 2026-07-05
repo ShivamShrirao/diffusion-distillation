@@ -318,9 +318,11 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 seg_hi = infer_ext[idx_dev]
                 seg_lo = infer_ext[idx_dev + 1]
                 grad_step_idx = seg_idx.float().mean().item()
+                segments = seg_idx
             else:
                 grad_step_idx = int(torch.randint(0, len(infer_timesteps), (1,), generator=self.shared_rng).item())
                 t_grad = infer_timesteps[grad_step_idx]
+                segments = torch.full((generated_latents.shape[0],), grad_step_idx)
 
                 # Keep the student's params gathered across the multi-forward rollout
                 # instead of re-all-gathering the full model every step; weights don't
@@ -355,9 +357,14 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             "rollout": [dmd_latents, do_gen_update, grad_step_idx],
             "real_latents": patched_latents,
             "gen_v": gen_v,
+            "segments": segments,
             "tdm": [prep["num_inference_steps"], seg_lo, seg_hi],
             "timings": [prep["text_encoder_time"], generate_time[0], prep["mask_time"][0], fetch_time_sec],
         }
+
+    def _reward_losses(self, batch: T2IBatch, setup: dict, dmd_latents: torch.Tensor):
+        """Hook for a reward term on the student's x0 (DMDR); no-op in the base trainer."""
+        return None
 
     def optimization_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
         setup = self.training_step(batch, fetch_time_sec=fetch_time_sec)
@@ -406,6 +413,13 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.record_loss_components({"loss": dmd_loss, "named_losses": dmd_named_losses})
 
             student_loss = dmd_loss
+
+            reward_outputs = self._reward_losses(batch, setup, dmd_latents)
+            if reward_outputs is not None:
+                reward_named = reward_outputs.get("named_losses") or {}
+                named_losses.update(reward_named)
+                self.record_loss_components({"loss": reward_outputs["loss"].detach(), "named_losses": reward_named})
+                student_loss = student_loss + reward_outputs["loss"]
 
             self.accelerator.backward(student_loss)
             fake_grad_stash = None

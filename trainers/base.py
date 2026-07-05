@@ -220,10 +220,9 @@ class BaseTrainer:
         # attention implementation, and one bad node downgrades the whole job.
         if self.args.attn_backend == "fa3":
             fa3_err = warmup_fa3_kernel(self.accelerator)
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                ok = torch.tensor(float(fa3_err is None), device=self.accelerator.device)
-                torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN)
-                if fa3_err is None and ok.item() == 0:
+            if self.accelerator.num_processes > 1:
+                ok = torch.tensor([float(fa3_err is None)], device=self.accelerator.device)
+                if fa3_err is None and self.accelerator.gather(ok).min().item() == 0:
                     fa3_err = "another rank failed to load the kernel"
             if fa3_err is not None:
                 logger.warning(f"FA3 kernel unavailable ({fa3_err}); falling back to attn_backend=native")

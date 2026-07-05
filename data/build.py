@@ -132,9 +132,12 @@ class DynamicResolutionScheduler:
 
     @staticmethod
     def _build_groups(buckets: List[BucketSpec]) -> List[List[BucketSpec]]:
-        groups: Dict[int, List[BucketSpec]] = {}
+        # Key on (token_count, batch_size), not their product: ranks draw different buckets
+        # from the same group each step, so every bucket in a group must share seq_len and
+        # batch size or cross-rank collectives see mismatched shapes.
+        groups: Dict[tuple, List[BucketSpec]] = {}
         for bucket in buckets:
-            groups.setdefault(bucket.batch_token_count, []).append(bucket)
+            groups.setdefault((bucket.token_count, bucket.batch_size), []).append(bucket)
         return [groups[k] for k in sorted(groups.keys())]
 
     @staticmethod

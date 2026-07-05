@@ -152,7 +152,13 @@ class FullFtEMA:
     def scatter_full_into_live(full_sd: dict, fsdp_root, use_fsdp: bool):
         """Scatter a full state dict into the live model; shard-aware under FSDP2."""
         if not use_fsdp:
-            fsdp_root.load_state_dict(full_sd, strict=False)
+            # Checkpoints store clean keys; a DDP-wrapped root expects "module."-prefixed
+            # ones and strict=False would turn the whole load into a silent no-op.
+            module = getattr(fsdp_root, "module", fsdp_root)
+            loaded = {k for k in full_sd if k in dict(module.named_parameters())}
+            if not loaded:
+                raise ValueError("EMA shadow load matched zero parameter keys — key-prefix mismatch")
+            module.load_state_dict(full_sd, strict=False)
             return
         from distributed import fsdp2_load_full_state
 

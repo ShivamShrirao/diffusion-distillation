@@ -464,17 +464,20 @@ class BaseTrainer:
         self.record_loss_components(outputs)
 
         self.accelerator.backward(loss)
+        # Step only on sync micro-steps: FSDP2 optimizers/schedulers are raw (never
+        # accelerator.prepare'd), so unlike the wrapped FSDP1 ones they don't skip
+        # non-sync steps themselves — ungated they'd break gradient accumulation.
         if self.accelerator.sync_gradients:
             grad_norm = self.clip_grad_norm(self.transformer)
             outputs.setdefault("log_extras", {})["grad_norm"] = grad_norm
-        for optimizer in self.optimizer:
-            optimizer.step()
-        for lr_scheduler in self.lr_scheduler:
-            lr_scheduler.step()
-        for optimizer in self.optimizer:
-            optimizer.zero_grad()
-        if self.ema_student is not None and self.accelerator.sync_gradients:
-            self.ema_student.update()
+            for optimizer in self.optimizer:
+                optimizer.step()
+            for lr_scheduler in self.lr_scheduler:
+                lr_scheduler.step()
+            for optimizer in self.optimizer:
+                optimizer.zero_grad()
+            if self.ema_student is not None:
+                self.ema_student.update()
 
         return outputs
 

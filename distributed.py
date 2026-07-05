@@ -185,9 +185,18 @@ def fsdp2_shard_model(model, accelerator, *, transformer_cls_names_to_wrap=None)
 
 def fsdp2_load_full_state(model, full_sd: dict):
     """Load a full (unsharded) state dict into a live FSDP2-sharded model. Every rank
-    passes the full sd it loaded and DCP takes the rank's own shard of each tensor."""
+    passes the full sd it loaded and DCP takes the rank's own shard of each tensor.
+
+    strict=False is required for DCP's full-state scatter, so guard against silently
+    resuming from a mismatched checkpoint by checking key coverage ourselves."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
+    missing = [k for k in model.state_dict() if k not in full_sd]
+    if missing:
+        raise ValueError(
+            f"FSDP2 full-state load: checkpoint is missing {len(missing)} model keys "
+            f"(e.g. {missing[:5]}) — refusing to silently resume from a mismatched checkpoint"
+        )
     set_model_state_dict(
         model,
         full_sd,

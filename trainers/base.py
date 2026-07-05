@@ -214,8 +214,20 @@ class BaseTrainer:
         # Warm the FA3 hub kernel once per node (local-main-first) BEFORE any model sets its
         # attention backend — extra_setup/configure_transformer/the main transformer below all
         # call set_attention_backend, and ungated each rank would re-fetch the ~824MB kernel.
+        # If the kernel can't load (missing `kernels` pkg, no hub access, non-FA3 GPU), fall
+        # back to native rather than dying at setup. The load result is node-local (each node
+        # fetches its own cache), so all-reduce the outcome: every rank must run the same
+        # attention implementation, and one bad node downgrades the whole job.
         if self.args.attn_backend == "fa3":
-            warmup_fa3_kernel(self.accelerator)
+            fa3_err = warmup_fa3_kernel(self.accelerator)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                ok = torch.tensor(float(fa3_err is None), device=self.accelerator.device)
+                torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN)
+                if fa3_err is None and ok.item() == 0:
+                    fa3_err = "another rank failed to load the kernel"
+            if fa3_err is not None:
+                logger.warning(f"FA3 kernel unavailable ({fa3_err}); falling back to attn_backend=native")
+                self.args.attn_backend = "native"
 
         # Reward / perceptual / ref-transformer models, and the VAE itself for trainers
         # that decode pixels (DMD-with-image-logging). Lives BEFORE the main
@@ -467,17 +479,20 @@ class BaseTrainer:
         self.record_loss_components(outputs)
 
         self.accelerator.backward(loss)
+        # Step only on sync micro-steps: FSDP2 optimizers/schedulers are raw (never
+        # accelerator.prepare'd), so unlike the wrapped FSDP1 ones they don't skip
+        # non-sync steps themselves — ungated they'd break gradient accumulation.
         if self.accelerator.sync_gradients:
             grad_norm = self.clip_grad_norm(self.transformer)
             outputs.setdefault("log_extras", {})["grad_norm"] = grad_norm
-        for optimizer in self.optimizer:
-            optimizer.step()
-        for lr_scheduler in self.lr_scheduler:
-            lr_scheduler.step()
-        for optimizer in self.optimizer:
-            optimizer.zero_grad()
-        if self.ema_student is not None and self.accelerator.sync_gradients:
-            self.ema_student.update()
+            for optimizer in self.optimizer:
+                optimizer.step()
+            for lr_scheduler in self.lr_scheduler:
+                lr_scheduler.step()
+            for optimizer in self.optimizer:
+                optimizer.zero_grad()
+            if self.ema_student is not None:
+                self.ema_student.update()
 
         return outputs
 

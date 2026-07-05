@@ -181,6 +181,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             ema_fp = os.path.join(ema_init, "diffusion_pytorch_model.safetensors") if ema_init else None
             if ema_fp and os.path.exists(ema_fp):
                 self.ema_student.load_shadow_from(ema_fp, self.transformer, bool(self.args.use_fsdp))
+                # A loaded shadow IS the seed — without this flag the first eligible sync
+                # step would reset_to_live() and silently discard the loaded EMA history.
+                self._ema_seeded = True
                 logger.info(f"Seeded EMA shadow from {ema_fp}")
 
         if self.args.lora_rank == 0 and (self.args.full_torch_compile or self.args.regional_compile):
@@ -562,63 +565,48 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         height: int,
         width: int,
     ) -> dict:
-        """Gather packed latents + per-rank (H, W) and decode on rank 0.
+        """Gather each sample's latents, caption and (H, W) in ONE collective; decode on rank 0.
 
-        Dynamic-resolution buckets let ranks pick different aspect ratios at the same step;
-        seq_len is identical across ranks (token count is the bucket key), but the unpacked
-        (H, W) differs. We gather the packed latents (same shape) and per-sample (H, W),
-        then rank 0 unpacks each with its own resolution. ALL ranks must reach this call.
+        Dynamic-resolution buckets let ranks pick different aspect ratios at the same step.
+        A single gather_object keeps every sample's latents tied to its own caption and
+        (H, W), so a rank-permuted collective (seen on p5e/torch 2.12: tensor gather and
+        object gather disagreed on rank order, pairing rank i's latents with rank i^2's
+        caption/hw) can only reorder panels, never mispair them. ALL ranks must reach this.
         """
         world = self.accelerator.num_processes
-        is_main = self.accelerator.is_main_process
         target = min(8, generated_latents.shape[0] * world)
         per_rank = (target + world - 1) // world
         vae_dtype = next(self.vae.parameters()).dtype
 
-        def take_local(packed):
-            local = packed[:per_rank]
-            if local.shape[0] < per_rank:
-                pad = local[-1:].expand(per_rank - local.shape[0], *local.shape[1:])
-                local = torch.cat([local, pad], dim=0)
-            return local.to(dtype=vae_dtype)
+        def take_local(packed, i):
+            idx = min(i, packed.shape[0] - 1)
+            return packed[idx : idx + 1].to(dtype=vae_dtype).cpu()
 
-        def gather_packed(packed):
-            return self.accelerator.gather(take_local(packed))[:target]
+        local_samples = []
+        for i in range(per_rank):
+            latents = {"generated": take_local(generated_latents, i)}
+            for key, packed in (dmd_log_latents or {}).items():
+                latents[key] = take_local(packed, i)
+            caption = captions[min(i, len(captions) - 1)] if len(captions) else ""
+            local_samples.append({"caption": caption, "hw": (height, width), "latents": latents})
+        gathered = gather_object(local_samples)[:target]
 
-        local_caps = list(captions[:per_rank])
-        while len(local_caps) < per_rank:
-            local_caps.append(local_caps[-1] if local_caps else "")
-        gathered_caps = gather_object(local_caps)[:target]
-        gathered_hw = gather_object([(height, width)] * per_rank)[:target]
-
-        def decode_per_sample(packed_all):
-            if not is_main:
-                return None
-            imgs = []
-            for i in range(packed_all.shape[0]):
-                h_i, w_i = gathered_hw[i]
-                img = decode_to_images(
-                    self.vae, packed_all[i : i + 1], h_i, w_i,
-                    self.vae_scale_factor, self.vae_config, self.args.do_patching,
-                )
-                imgs.append(img[0])
-            return imgs
-
-        def to_wandb_list(imgs):
-            out = []
-            for i, t in enumerate(imgs):
-                arr = (t * 255).clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
-                out.append(wandb.Image(arr, caption=get_caption_short_description(gathered_caps[i]), file_type="jpg"))
-            return out
-
+        if not self.accelerator.is_main_process:
+            return {}
+        device = generated_latents.device
         img_logs = {}
-        gen_imgs = decode_per_sample(gather_packed(generated_latents))
-        if is_main:
-            img_logs["dmd/generated"] = to_wandb_list(gen_imgs)
-        for key, latents in (dmd_log_latents or {}).items():
-            dec = decode_per_sample(gather_packed(latents))
-            if is_main:
-                img_logs[f"dmd/{key}"] = to_wandb_list(dec)
+        for sample in gathered:
+            h, w = sample["hw"]
+            caption = get_caption_short_description(sample["caption"])
+            for key, packed in sample["latents"].items():
+                img = decode_to_images(
+                    self.vae, packed.to(device), h, w,
+                    self.vae_scale_factor, self.vae_config, self.args.do_patching,
+                )[0]
+                arr = (img * 255).clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
+                img_logs.setdefault(f"dmd/{key}", []).append(
+                    wandb.Image(arr, caption=caption, file_type="jpg")
+                )
         return img_logs
 
     @torch.no_grad()

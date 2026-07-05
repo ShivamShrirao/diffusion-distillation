@@ -51,9 +51,16 @@ def warmup_fa3_kernel(accelerator):
 
     Left ungated, every rank pulls the ~824MB kernel ``.so`` from the HF hub at once. The HF
     cache is node-local, so this gates on the *local* main process: local rank 0 on each node
-    downloads first, the rest of that node then hit the warm cache."""
+    downloads first, the rest of that node then hit the warm cache. Returns the load error
+    (caller falls back to native) or None on success; the error is caught INSIDE the
+    local-main-first block so a failing rank still reaches the exit barrier and ranks never
+    deadlock on mismatched collectives."""
     with accelerator.local_main_process_first():
-        load_fa3_kernel()
+        try:
+            load_fa3_kernel()
+            return None
+        except Exception as e:
+            return e
 
 
 def diffusers_backend_name(backend: str) -> str:

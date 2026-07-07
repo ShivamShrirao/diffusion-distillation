@@ -630,16 +630,17 @@ class BaseTrainer:
         self.train_loss = 0.0
         self.named_loss_acc = {}
 
-    def run_text_encoder(self, captions):
+    def run_text_encoder(self, captions, images=None):
         """Forward the text encoder, align layer count to the transformer, and return
         ``(encoder_hidden_states, text_encoder_layers, prompt_attention_mask, encoder_time_sec)``.
+        ``images``: per caption, its images to edit (Qwen3-VL reads them with the edit prompt), or None.
 
         Side-effect: trims ``self.null_conditioning_layers`` once on the first call so it
         matches ``total_num_layers``. Subsequent calls are no-ops on it.
         """
         timer = []
         with CudaTimerContext(timer):
-            eh, te_layers, prompt_attn_mask = self.get_prompt_embedds(captions)
+            eh, te_layers, prompt_attn_mask = self.get_prompt_embedds(captions, images)
         te_layers = list(te_layers)
         n = self.total_num_layers
         if len(te_layers) >= n:
@@ -697,6 +698,10 @@ class BaseTrainer:
         return None
 
     @torch.no_grad()
+    def log_caption_for(self, caption: str) -> str:
+        """Caption shown under logged images."""
+        return get_caption_short_description(caption)
+
     def run_validation(self):
         """Generate samples on the fixed prompt set with the live student weights (logged
         under ``val/samples``), and, if an EMA shadow exists, again with the EMA weights
@@ -772,7 +777,7 @@ class BaseTrainer:
         wandb_images = []
         for idx in sorted(by_idx):
             arr = (by_idx[idx] * 255).clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
-            wandb_images.append(wandb.Image(arr, caption=get_caption_short_description(self.val_prompts[idx]), file_type="jpg"))
+            wandb_images.append(wandb.Image(arr, caption=self.log_caption_for(self.val_prompts[idx]), file_type="jpg"))
         wandb.log({log_key: wandb_images}, step=self.global_step)
 
     # ---------------------------------------------------------------

@@ -58,6 +58,16 @@ def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
     return vae.decode(raw.to(vae.dtype), return_dict=False)[0].float()
 
 
+@torch.no_grad()
+def encode_images(vae, images: torch.Tensor) -> torch.Tensor:
+    """Images (B, 3, H, W) in [-1, 1] -> latents (B, C, H / 8, W / 8), normalized as the pipeline
+    normalizes them (BatchNorm statistics on 2x2 patches)."""
+    raw = vae.encode(images.to(vae.dtype)).latent_dist.mode().float()
+    mean = vae.bn.running_mean.view(1, -1, 1, 1).to(raw.device, torch.float32)
+    std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1).to(raw.device, torch.float32) + vae.config.batch_norm_eps)
+    return _unpatchify((_patchify(raw) - mean) / std)
+
+
 def decode_to_images(
     vae,
     packed_latents: torch.Tensor,

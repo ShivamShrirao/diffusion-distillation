@@ -61,6 +61,8 @@ def replicate_attn_mask(attn_kwargs: dict, n: int) -> dict:
     am = out.get("attention_mask")
     if am is not None:
         out["attention_mask"] = replicate_attention_mask(am, n)
+    if out.get("context_latents") is not None:
+        out["context_latents"] = out["context_latents"] * n
     return out
 
 

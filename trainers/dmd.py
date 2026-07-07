@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 import shutil
 import wandb
 from accelerate.utils import gather_object
@@ -14,7 +15,7 @@ from safetensors.torch import load_file, save_file
 from args.base_args import add_base_args
 from args.data_args import add_data_args
 from args.dmd_args import add_decoupled_dmd_args
-from data.batch import T2IBatch, get_caption_short_description
+from data.batch import T2IBatch
 from data.build import build_dataloader_t2i
 from distributed import compile_transformer, fsdp2_set_reshard_after_forward, fsdp2_shard_model
 from lora.adapters import LORA_TARGET_MODULES
@@ -31,7 +32,7 @@ from train_utils.runtime import CudaTimerContext
 from losses.dmd import compute_decoupled_dmd_loss, compute_fake_score_loss
 from train_utils.attention import build_attention_mask, diffusers_backend_name
 from models.transformer import Fibo2Transformer2DModel, build_transformer_config
-from models.vae import build_vae, decode_to_images
+from models.vae import build_vae, decode_latents, decode_to_images
 from schedulers.flow_matching import build_infer_scheduler, build_infer_timesteps
 from schedulers.inference import predict_flow_step
 from trainers.base import BaseTrainer, logger
@@ -204,6 +205,25 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         for param, grad in stashed:
             param.grad = grad
 
+    def is_edit_batch(self, batch) -> bool:
+        references = getattr(batch, "references", None)
+        has_references = references is not None and any(r is not None for r in references)
+        if has_references:
+            assert all(r is not None for r in references), "mixed edit/T2I microbatch"
+        return has_references
+
+    def context_references_for(self, batch) -> list | None:
+        """Per record, the latents of its images to edit (Fibo 2.0's context tokens); None for T2I."""
+        return None
+
+    def prompt_images_for(self, batch) -> list | None:
+        """Per record, its images to edit as the text encoder reads them; None for T2I."""
+        return None
+
+    def validation_inputs(self, caption: str, height: int, width: int):
+        """``(prompt, text-encoder images, context latents)`` of one validation entry; T2I: the caption alone."""
+        return caption, None, None
+
     def prepare_dmd_step(self, batch: T2IBatch) -> dict:
         """Shared step prologue for the DMD trainers: conditioning, packing, attention
         mask, per-step K / timestep grid, and initial noise. The trainer-specific rollout
@@ -211,7 +231,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         height, width = batch.resolution or self.args.resolution
         device = self.accelerator.device
 
-        eh, te_layers, prompt_attn_mask, text_encoder_time = self.run_text_encoder(batch.captions)
+        eh, te_layers, prompt_attn_mask, text_encoder_time = self.run_text_encoder(batch.captions, self.prompt_images_for(batch))
         pixel_values = batch.pixel_values.to(device=device, dtype=torch.float32, non_blocking=True)
         # Conditioning in the compute dtype up front: the loss helpers' .to(model_dtype)
         # casts (~60 tensors per call site) become no-ops.
@@ -219,6 +239,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         prompt_attn_mask = prompt_attn_mask.to(device=device, dtype=self.weight_dtype)
 
         latents = (pixel_values - self.vae_config["shift_factor"]) * self.vae_config["scaling_factor"]
+        context = self.context_references_for(batch)
 
 
         patched_latents, patched_image_ids = pack_t2i(latents, height, width, self.vae_scale_factor, self.args.do_patching, device)
@@ -231,6 +252,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         else:
             attn_mask = None
         joint_attn_kwargs = {"attention_mask": attn_mask}
+        if context is not None:
+            joint_attn_kwargs["context_latents"] = context
         if self.args.lora_rank > 0:
             joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer)
 
@@ -481,6 +504,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 generated_latents=dmd_latents.detach(),
                 dmd_log_latents=dmd_outputs["log_latents"] if (do_gen_update and dmd_outputs is not None) else None,
                 captions=batch.captions,
+                context_latents=joint_attn_kwargs.get("context_latents"),
                 height=height,
                 width=width,
             )
@@ -569,6 +593,17 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped, writes=writes)
         write_checkpoint_async(save_path, writes, self.accelerator.is_main_process)
 
+    def reference_panel(self, references, height: int, device):
+        """One record's images to edit, decoded, scaled to ``height`` and side by side; None for T2I."""
+        if not references:
+            return None
+        panel = []
+        for ref in references:
+            img = (decode_latents(self.vae, ref[None].to(device)) / 2 + 0.5).clamp(0, 1)
+            size = (height, round(img.shape[-1] * height / img.shape[-2]))
+            panel.append(F.interpolate(img, size=size, mode="bilinear", antialias=True)[0])
+        return torch.cat(panel, dim=-1)
+
     @torch.no_grad()
     def _build_image_logs(
         self,
@@ -576,6 +611,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         generated_latents: torch.Tensor,
         dmd_log_latents: dict | None,
         captions,
+        context_latents: list | None = None,  # per record, the latents of its images to edit
         height: int,
         width: int,
     ) -> dict:
@@ -602,7 +638,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             for key, packed in (dmd_log_latents or {}).items():
                 latents[key] = take_local(packed, i)
             caption = captions[min(i, len(captions) - 1)] if len(captions) else ""
-            local_samples.append({"caption": caption, "hw": (height, width), "latents": latents})
+            context = [ref.cpu() for ref in context_latents[min(i, len(context_latents) - 1)]] if context_latents else None
+            local_samples.append({"caption": caption, "hw": (height, width), "latents": latents, "context": context})
         gathered = gather_object(local_samples)[:target]
 
         if not self.accelerator.is_main_process:
@@ -611,12 +648,15 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         img_logs = {}
         for sample in gathered:
             h, w = sample["hw"]
-            caption = get_caption_short_description(sample["caption"])
+            caption = self.log_caption_for(sample["caption"])
+            panel = self.reference_panel(sample["context"], h, device)
             for key, packed in sample["latents"].items():
                 img = decode_to_images(
                     self.vae, packed.to(device), h, w,
                     self.vae_scale_factor, self.vae_config, self.args.do_patching,
                 )[0]
+                if key == "generated" and panel is not None:
+                    img = torch.cat([panel, img], dim=-1)  # images to edit | edited
                 arr = (img * 255).clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
                 img_logs.setdefault(f"dmd/{key}", []).append(
                     wandb.Image(arr, caption=caption, file_type="jpg")
@@ -631,7 +671,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         ``(1, seq_len, C)``; mirrors the ``training_step`` rollout
         but runs every step under no_grad — no grad step.
         """
-        eh, te_layers, prompt_attn_mask, _ = self.run_text_encoder([caption])
+        caption, images, context = self.validation_inputs(caption, height, width)
+        eh, te_layers, prompt_attn_mask, _ = self.run_text_encoder([caption], images)
         eh = eh.to(device=device, dtype=torch.float32)
         prompt_attn_mask = prompt_attn_mask.to(device=device, dtype=torch.float32)
 
@@ -645,6 +686,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         attn_mask = build_attention_mask(prompt_attn_mask, latents_seq_len, self.weight_dtype, self.args.attn_backend)
         joint_attn_kwargs = {"attention_mask": attn_mask}
+        if context is not None:
+            joint_attn_kwargs["context_latents"] = context
         if self.args.lora_rank > 0:
             joint_attn_kwargs["lora_scales"] = make_scales("student", self.transformer)
 

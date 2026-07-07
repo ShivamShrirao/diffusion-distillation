@@ -22,7 +22,9 @@ class Fibo2Transformer2DModel(BriaFibo2Transformer2DModel):
     ``timestep`` is in ``[0, 1000]``, ``encoder_hidden_states`` is the Perceiver bundle and
     ``text_encoder_layers`` the injection bundles. The text padding mask is read off the
     joint attention mask (text tokens first, then image tokens). ``lora_scales`` in
-    ``joint_attention_kwargs`` picks the static multi-LoRA adapter. Returns ``(v_tokens, None)``.
+    ``joint_attention_kwargs`` picks the static multi-LoRA adapter. ``context_latents`` in ``joint_attention_kwargs``
+    (per record, the (C, h, w) latents of its images to edit) join the forward as clean context
+    tokens. Returns ``(v_tokens, None)``.
     """
 
     @property
@@ -53,6 +55,11 @@ class Fibo2Transformer2DModel(BriaFibo2Transformer2DModel):
             if text_mask.all():
                 text_mask = None
         bundles = torch.stack([encoder_hidden_states, *text_encoder_layers], dim=1)
+        context = (joint_attention_kwargs or {}).get("context_latents")
+        if context is not None:  # per record, its images to edit
+            if len({tuple(tuple(x.shape) for x in images) for images in context}) > 1:
+                raise ValueError("the padded forward needs the same count and sizes of images to edit in every record")
+            context = [torch.stack(images).to(latents.dtype) for images in zip(*context)]
 
         with self.lora_scales((joint_attention_kwargs or {}).get("lora_scales")):
             out = super().forward(
@@ -60,6 +67,7 @@ class Fibo2Transformer2DModel(BriaFibo2Transformer2DModel):
                 timestep=timestep / 1000.0,
                 encoder_hidden_states=bundles,
                 encoder_attention_mask=text_mask,
+                context_latents=context,
                 return_dict=False,
             )[0]
         return self._patchify(out), None

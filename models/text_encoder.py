@@ -12,6 +12,7 @@ the processor/encoder and `args.max_sequence_length` for the entrypoints.
 from typing import List, Union
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from diffusers.pipelines.bria_fibo2.pipeline_bria_fibo2 import BriaFibo2Pipeline
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
@@ -22,15 +23,22 @@ def get_qwen3vl_prompt_embeds(
     text_encoder: Qwen3VLForConditionalGeneration,
     prompts: Union[str, List[str]] = None,
     max_sequence_length: int = 2048,
+    images: List[list | None] | None = None,
 ):
+    """With ``images`` (per prompt: its images to edit, or None), each prompt is encoded with its own
+    images as Fibo 2.0's pipeline encodes an edit prompt, and the batch is right-padded."""
     prompts = [prompts] if isinstance(prompts, str) else prompts
-    bundles, attention_mask = BriaFibo2Pipeline._get_qwen_prompt_embeds(
-        text_encoder,
-        processor,
-        prompts,
-        device=text_encoder.device,
-        max_sequence_length=max_sequence_length,
-    )
+    kwargs = dict(device=text_encoder.device, max_sequence_length=max_sequence_length)
+    if images is None:
+        bundles, attention_mask = BriaFibo2Pipeline._get_qwen_prompt_embeds(text_encoder, processor, prompts, **kwargs)
+    else:
+        encoded = [
+            BriaFibo2Pipeline._get_qwen_prompt_embeds(text_encoder, processor, [p], image=imgs or None, **kwargs)[0][0]
+            for p, imgs in zip(prompts, images)
+        ]
+        lengths = torch.tensor([e.shape[1] for e in encoded], device=text_encoder.device)
+        bundles = pad_sequence([e.transpose(0, 1) for e in encoded], batch_first=True).transpose(1, 2)
+        attention_mask = torch.arange(bundles.shape[2], device=text_encoder.device) < lengths[:, None]
     if len(prompts) == 1:
         assert attention_mask.all()
     hidden_states = list(bundles[:, 1:].unbind(dim=1))
@@ -77,19 +85,20 @@ def init_text_encoder(model_path: str, device, weight_dtype):
 def build_text_encoder(args, device, weight_dtype):
     """Returns `(processor, encoder, get_prompt_embeds_fn)` for use in the training loop.
 
-    The returned callable has signature `(prompts) -> (embeds, hidden_states, attn_mask)`
+    The returned callable has signature `(prompts, images=None) -> (embeds, hidden_states, attn_mask)`
     and closes over `args.max_sequence_length`.
     """
     processor, text_encoder, encoder_callable = init_text_encoder(
         args.pretrained_model_name_or_path, device, weight_dtype
     )
 
-    def get_prompt_embeds(prompts):
+    def get_prompt_embeds(prompts, images=None):
         return encoder_callable(
             processor,
             text_encoder,
             prompts=prompts,
             max_sequence_length=args.max_sequence_length,
+            images=images,
         )
 
     return processor, text_encoder, get_prompt_embeds

@@ -1,4 +1,4 @@
-"""Dataloader builder for the T2I entrypoints.
+"""Dataloader builders for the T2I and edit trainers.
 
 Each builder returns:
     `(get_dataloader: Callable[[], DataLoader], total_batch_no_acc: int)`
@@ -10,11 +10,12 @@ step, while ranks may choose different same-token-count resolutions. The builder
 differ only in which keys they pull out of each record and what the collate produces —
 the scheduler / tar-loading / batching wiring is shared.
 
-`--random_latents` swaps the real tar source for a synthetic single-bucket stream and
+`--random_latents` (T2I only) swaps the real tar source for a synthetic single-bucket stream and
 reuses the same preprocess / collate, so no data reads happen.
 """
 
 import glob
+import io
 import os
 import queue
 import random
@@ -25,7 +26,10 @@ from typing import Callable, Dict, Iterator, List, Tuple
 import numpy as np
 import torch
 import webdataset as wds
+from diffusers.pipelines.bria_fibo2.image_processor import BriaFibo2ImageProcessor
+from PIL import Image
 
+from data.batch import edit_prompt
 from data.json_data import ResolutionData, list_resolution_data
 from models.vae import vae_scale_factor_from_config
 from train_utils.runtime import get_logger
@@ -471,19 +475,19 @@ def build_random_dataloader(args, build_sample, preprocess, collate, logger) -> 
 # ---------------------------------------------------------------------------
 
 
+def record_latents(record, width: int, height: int) -> torch.Tensor:
+    """A record's VAE latents at the bucket resolution."""
+    for key in (f"latents_{width}_{height}", f"good_latents_{width}_{height}"):
+        if key in record:
+            return record[key]
+    raise Exception(f"latents not found in record for resolution {width}x{height}")
+
+
 def build_dataloader_t2i(args, vae_config, logger) -> Tuple[Callable, int]:
     def preprocess(record, bucket: BucketSpec):
         if "pickle" in record:
             record = record["pickle"]
-        width, height = bucket.width, bucket.height
-        example = {"caption": record["caption"]}
-        if f"latents_{width}_{height}" in record:
-            example["pixel_values"] = record[f"latents_{width}_{height}"]
-        elif f"good_latents_{width}_{height}" in record:
-            example["pixel_values"] = record[f"good_latents_{width}_{height}"]
-        else:
-            raise Exception(f"latents not found in record for resolution {width}x{height}")
-        return example
+        return {"caption": record["caption"], "pixel_values": record_latents(record, bucket.width, bucket.height)}
 
     def collate(examples, bucket: BucketSpec):
         captions = [e["caption"] for e in examples]
@@ -501,4 +505,42 @@ def build_dataloader_t2i(args, vae_config, logger) -> Tuple[Callable, int]:
 
         return build_random_dataloader(args, build_sample, preprocess, collate, logger)
 
+    return build_dynamic_dataloader(args, vae_config, logger, preprocess, collate)
+
+
+# ---------------------------------------------------------------------------
+# Edit
+# ---------------------------------------------------------------------------
+
+
+def preprocess_references(images, height: int, width: int):
+    """The images to edit as Fibo 2.0 was trained on them (its image processor): the VAE's crops, (1, 3, H, W)
+    in [-1, 1] (one image at the target size, several each at its own aspect ratio and about the target
+    area), and Qwen3-VL's copies."""
+    processor = BriaFibo2ImageProcessor(vae_scale_factor=16)
+    return processor.preprocess(images, height=height, width=width, area=height * width)
+
+
+def build_dataloader_edit(args, vae_config, logger) -> Tuple[Callable, int]:
+    """Edit records. An edit record also holds ``reference_images`` (the encoded images to edit) and ``instruction``;
+    its ``caption``, of the result, is optional."""
+
+    def preprocess(record, bucket: BucketSpec):
+        if "pickle" in record:
+            record = record["pickle"]
+        example = {"caption": record.get("caption"), "references": None}
+        example["pixel_values"] = record_latents(record, bucket.width, bucket.height)
+        if record.get("reference_images"):
+            images = [x if isinstance(x, Image.Image) else Image.open(io.BytesIO(x)) for x in record["reference_images"]]
+            example["references"] = preprocess_references(images, bucket.height, bucket.width)
+            example["caption"] = edit_prompt(record.get("caption"), record["instruction"])
+        return example
+
+    def collate(examples, bucket: BucketSpec):
+        captions = [e["caption"] for e in examples]
+        pixel_values = torch.stack([e["pixel_values"] for e in examples])
+        return pixel_values, captions, (bucket.height, bucket.width), [e["references"] for e in examples]
+
+    if args.random_latents:
+        raise ValueError("--random_latents has no images to edit")
     return build_dynamic_dataloader(args, vae_config, logger, preprocess, collate)

@@ -2,17 +2,13 @@
 
 Builds the bare transformer: Fibo 2.0's ``BriaFibo2Transformer2DModel`` and an optional
 ``--transformer_init`` weight load over the pretrained weights.
-LoRA / adapter configuration, gradient checkpointing, and ``accelerator.prepare``
-are owned by the trainer (see ``BaseTrainer.configure_transformer``).
+Gradient checkpointing and ``accelerator.prepare`` are owned by the trainer (see ``BaseTrainer.configure_transformer``).
 """
 import os
-from contextlib import contextmanager
 
 import torch
 from diffusers import BriaFibo2Transformer2DModel
 from safetensors.torch import load_file
-
-from lora.static_multi_lora import StaticMultiLoraLinear
 
 
 class Fibo2Transformer2DModel(BriaFibo2Transformer2DModel):
@@ -21,8 +17,7 @@ class Fibo2Transformer2DModel(BriaFibo2Transformer2DModel):
     ``hidden_states`` are 2x2-patch tokens ``(B, N, C * 4)`` laid out on the ``img_ids`` grid,
     ``timestep`` is in ``[0, 1000]``, ``encoder_hidden_states`` is the Perceiver bundle and
     ``text_encoder_layers`` the injection bundles. The text padding mask is read off the
-    joint attention mask (text tokens first, then image tokens). ``lora_scales`` in
-    ``joint_attention_kwargs`` picks the static multi-LoRA adapter. ``context_latents`` in ``joint_attention_kwargs``
+    joint attention mask (text tokens first, then image tokens). ``context_latents`` in ``joint_attention_kwargs``
     (per record, the (C, h, w) latents of its images to edit) join the forward as clean context
     tokens. Returns ``(v_tokens, None)``.
     """
@@ -61,48 +56,15 @@ class Fibo2Transformer2DModel(BriaFibo2Transformer2DModel):
                 raise ValueError("the padded forward needs the same count and sizes of images to edit in every record")
             context = [torch.stack(images).to(latents.dtype) for images in zip(*context)]
 
-        with self.lora_scales((joint_attention_kwargs or {}).get("lora_scales")):
-            out = super().forward(
-                hidden_states=latents,
-                timestep=timestep / 1000.0,
-                encoder_hidden_states=bundles,
-                encoder_attention_mask=text_mask,
-                context_latents=context,
-                return_dict=False,
-            )[0]
+        out = super().forward(
+            hidden_states=latents,
+            timestep=timestep / 1000.0,
+            encoder_hidden_states=bundles,
+            encoder_attention_mask=text_mask,
+            context_latents=context,
+            return_dict=False,
+        )[0]
         return self._patchify(out), None
-
-    @contextmanager
-    def lora_scales(self, scales):
-        """Set the static multi-LoRA adapter scales for one forward. Under gradient
-        checkpointing each block sets them again on recompute, so a later forward with
-        other scales (student vs fake) does not leak into this forward's backward."""
-        if scales is None:
-            yield
-            return
-        set_lora_scales(self, scales)
-        checkpoint_func = getattr(self, "_gradient_checkpointing_func", None)
-        if self.gradient_checkpointing and checkpoint_func is not None:
-
-            def scaled_checkpoint(block, *args):
-                def run(*inner):
-                    set_lora_scales(block, scales)
-                    return block(*inner)
-
-                return checkpoint_func(run, *args)
-
-            self._gradient_checkpointing_func = scaled_checkpoint
-        try:
-            yield
-        finally:
-            if checkpoint_func is not None:
-                self._gradient_checkpointing_func = checkpoint_func
-
-
-def set_lora_scales(module, scales):
-    for sub in module.modules():
-        if isinstance(sub, StaticMultiLoraLinear):
-            sub._lora_scales = scales
 
 
 def build_transformer_config(args, vae_config: dict, logger) -> dict:
@@ -141,7 +103,7 @@ def build_transformer(args, vae_config: dict, accelerator, logger):
 
     Builds the pretrained model and loads ``--transformer_init`` weights over it. The
     returned transformer is in fp32 with ``requires_grad=True`` everywhere; the trainer's
-    ``configure_transformer`` hook is responsible for LoRA setup and dtype/grad masking
+    ``configure_transformer`` hook is responsible for dtype/grad masking
     before ``accelerator.prepare``.
 
     ``total_num_layers`` is the number of injection bundles the transformer reads, used by

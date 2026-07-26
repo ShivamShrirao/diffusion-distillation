@@ -9,13 +9,6 @@ DMD/DMD2 formulation in x0 space:
 The DM gradient direction is `x0_real - x0_fake` normalised to unit L1
 magnitude (DMD2 weighting trick); the CA gradient direction is
 `(rgs - 1) * (x0_real_cond - x0_real_uncond)` normalised the same way.
-
-Active LoRA adapter per forward is selected via an explicit
-`lora_scales` tuple of floats passed through `joint_attention_kwargs`. The
-transformer's checkpoint wrapper threads it through the gradient-checkpoint
-boundary so backward recompute uses the same scales as the original forward
-(mutating module state between forward and backward would otherwise corrupt
-the recomputed activations).
 """
 
 from __future__ import annotations
@@ -23,7 +16,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from lora.static_multi_lora import StaticMultiLoraLinear, make_scales
+from losses.pseudo_huber import normalized_pseudo_huber_loss
 from train_utils.attention import replicate_attention_mask
 
 
@@ -66,6 +59,77 @@ def replicate_attn_mask(attn_kwargs: dict, n: int) -> dict:
     return out
 
 
+def sample_decoupled_dmd_timesteps(
+    *, batch_size: int, device: torch.device, seg_lo, seg_hi, args
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, bool]:
+    """Draw CA and DM renoise timesteps for either the TDM segment or global schedule."""
+    tdm_renoise = getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None
+    if tdm_renoise:
+        lo_sigma = torch.as_tensor(seg_lo, device=device, dtype=torch.float32) / args.noise_max_t
+        hi_sigma = torch.as_tensor(seg_hi, device=device, dtype=torch.float32) / args.noise_max_t
+
+        return (
+            (
+                (lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma))
+                * args.noise_max_t
+            ).long().clamp(min=0, max=args.noise_max_t - 1),
+            (
+                (lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma))
+                * args.noise_max_t
+            ).long().clamp(min=0, max=args.noise_max_t - 1),
+            lo_sigma,
+            True,
+        )
+
+    gen_sigma = torch.tensor(seg_hi / args.noise_max_t, device=device)
+    ca_sigmas = torch.rand(batch_size, device=device) * gen_sigma
+    ca_timesteps = (ca_sigmas * args.noise_max_t).long().clamp(max=int(seg_hi))
+    dm_timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
+    return ca_timesteps, dm_timesteps, None, False
+
+
+def renoise_decoupled_dmd_latents(
+    *,
+    generated_latents: torch.Tensor,
+    generated_v: torch.Tensor | None,
+    lower_sigma: torch.Tensor | None,
+    ca_timesteps: torch.Tensor,
+    dm_timesteps: torch.Tensor,
+    tdm_renoise: bool,
+    noise_max_t: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare the CA and DM teacher inputs using TDM bridge or standard flow noising."""
+    if tdm_renoise and generated_v is not None:
+        seg_lo = lower_sigma * noise_max_t
+        ca_noisy, _ = add_segment_bridge_noise(
+            generated_latents, generated_v, seg_lo, ca_timesteps, noise_max_t
+        )
+        dm_noisy, _ = add_segment_bridge_noise(
+            generated_latents, generated_v, seg_lo, dm_timesteps, noise_max_t
+        )
+        return ca_noisy, dm_noisy
+    return (
+        add_flow_noise(generated_latents, ca_timesteps, noise_max_t),
+        add_flow_noise(generated_latents, dm_timesteps, noise_max_t),
+    )
+
+
+def dmd_component_loss(
+    generated_latents: torch.Tensor,
+    update_raw: torch.Tensor,
+    update: torch.Tensor,
+    norm: torch.Tensor,
+    huber_c: float,
+) -> torch.Tensor:
+    if huber_c > 0:
+        return normalized_pseudo_huber_loss(generated_latents, update_raw, norm, huber_c)
+    return F.mse_loss(
+        generated_latents.float(),
+        (generated_latents + update).detach().float(),
+        reduction="mean",
+    )
+
+
 def compute_decoupled_dmd_loss(
     *,
     generated_latents: torch.Tensor,
@@ -85,37 +149,25 @@ def compute_decoupled_dmd_loss(
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
-    use_lora_scales = real_transformer is fake_transformer
-    fake_scales = make_scales("fake", fake_transformer) if use_lora_scales else None
-    disabled_scales = make_scales(None, real_transformer) if use_lora_scales else None
 
     with torch.no_grad():
-        # seg_hi == t_grad == infer_timesteps[grad_step_idx]; the old linspace+logit+sigmoid
-        # recomputed exactly that flow-match time-shift, so use the rollout timestep directly.
-        if getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None:
-            # TDM: CA + DM renoise uniformly within the segment.
-            lo_sigma = torch.as_tensor(seg_lo, device=device, dtype=torch.float32) / args.noise_max_t
-            hi_sigma = torch.as_tensor(seg_hi, device=device, dtype=torch.float32) / args.noise_max_t
-            ca_sigmas = lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma)
-            ca_timesteps = (ca_sigmas * args.noise_max_t).long().clamp(min=0, max=args.noise_max_t - 1)
-            dm_sigmas = lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma)
-            dm_timesteps = (dm_sigmas * args.noise_max_t).long().clamp(min=0, max=args.noise_max_t - 1)
-        else:
-            # Non-TDM: CA = uniform in (0, gen_sigma]; DM = global uniform.
-            gen_sigma = torch.tensor(seg_hi / args.noise_max_t, device=device)
-            ca_upper = int(seg_hi)
-            ca_sigmas = torch.rand(batch_size, device=device) * gen_sigma
-            ca_timesteps = (ca_sigmas * args.noise_max_t).long().clamp(max=ca_upper)
-            dm_timesteps = (torch.rand(batch_size, device=device) * args.noise_max_t).long().clamp(max=args.noise_max_t - 1)
-
-        tdm_renoise = getattr(args, "tdm_segment_renoise", 0) and seg_hi is not None
-        if tdm_renoise and generated_v is not None:
-            seg_lo_t = lo_sigma * args.noise_max_t
-            ca_noisy, _ = add_segment_bridge_noise(generated_latents, generated_v, seg_lo_t, ca_timesteps, args.noise_max_t)
-            dm_noisy, _ = add_segment_bridge_noise(generated_latents, generated_v, seg_lo_t, dm_timesteps, args.noise_max_t)
-        else:
-            ca_noisy = add_flow_noise(generated_latents, ca_timesteps, args.noise_max_t)
-            dm_noisy = add_flow_noise(generated_latents, dm_timesteps, args.noise_max_t)
+        # seg_hi is the selected rollout timestep, so no schedule reconstruction is needed.
+        ca_timesteps, dm_timesteps, lower_sigma, tdm_renoise = sample_decoupled_dmd_timesteps(
+            batch_size=batch_size,
+            device=device,
+            seg_lo=seg_lo,
+            seg_hi=seg_hi,
+            args=args,
+        )
+        ca_noisy, dm_noisy = renoise_decoupled_dmd_latents(
+            generated_latents=generated_latents,
+            generated_v=generated_v,
+            lower_sigma=lower_sigma,
+            ca_timesteps=ca_timesteps,
+            dm_timesteps=dm_timesteps,
+            tdm_renoise=tdm_renoise,
+            noise_max_t=args.noise_max_t,
+        )
 
         cond_h = cond_hidden_states.to(dtype=model_dtype)
         uncond_h = uncond_hidden_states.to(dtype=model_dtype)
@@ -128,8 +180,6 @@ def compute_decoupled_dmd_loss(
         real_enc = torch.cat([cond_h, uncond_h, cond_h], dim=0)
         real_layers = [torch.cat([cl, ul, cl], dim=0) for cl, ul in zip(cond_l, uncond_l)]
         real_attn = replicate_attn_mask(attn_kwargs, 3)
-        if disabled_scales is not None:
-            real_attn["lora_scales"] = disabled_scales
 
         real_pred, _ = real_transformer(
             hidden_states=real_latents,
@@ -143,8 +193,6 @@ def compute_decoupled_dmd_loss(
         real_ca_cond_v, real_ca_uncond_v, real_dm_cond_v = real_pred.chunk(3, dim=0)
 
         fake_attn_kwargs = {**(attn_kwargs or {})}
-        if fake_scales is not None:
-            fake_attn_kwargs["lora_scales"] = fake_scales
         fake_dm_cond_v, _ = fake_transformer(
             hidden_states=dm_noisy.to(dtype=model_dtype),
             timestep=dm_timesteps.to(device=dm_noisy.device, dtype=torch.float32),
@@ -160,24 +208,18 @@ def compute_decoupled_dmd_loss(
         real_dm_cond_x0 = x0_from_v(dm_noisy, real_dm_cond_v, dm_timesteps, args.noise_max_t)
         fake_dm_cond_x0 = x0_from_v(dm_noisy, fake_dm_cond_v, dm_timesteps, args.noise_max_t)
 
-        ca_update = (args.dmd_real_guidance_scale - 1.0) * (real_ca_cond_x0 - real_ca_uncond_x0)
+        ca_update_raw = (args.dmd_real_guidance_scale - 1.0) * (real_ca_cond_x0 - real_ca_uncond_x0)
         ca_norm = (real_ca_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
-        ca_update = ca_update / (ca_norm + 1e-8)
+        ca_update = ca_update_raw / (ca_norm + 1e-8)
 
-        dm_update = real_dm_cond_x0 - fake_dm_cond_x0
+        dm_update_raw = real_dm_cond_x0 - fake_dm_cond_x0
         dm_norm = (real_dm_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
-        dm_update = dm_update / (dm_norm + 1e-8)
+        dm_update = dm_update_raw / (dm_norm + 1e-8)
 
-    loss_ca = F.mse_loss(
-        generated_latents.float(),
-        (generated_latents + ca_update).detach().float(),
-        reduction="mean",
-    )
-    loss_dm = F.mse_loss(
-        generated_latents.float(),
-        (generated_latents + dm_update).detach().float(),
-        reduction="mean",
-    )
+    huber_c = getattr(args, "dmd_pseudo_huber_c", 0.0)
+
+    loss_ca = dmd_component_loss(generated_latents, ca_update_raw, ca_update, ca_norm, huber_c)
+    loss_dm = dmd_component_loss(generated_latents, dm_update_raw, dm_update, dm_norm, huber_c)
     loss = args.dmd_loss_scale * (args.dmd_ca_weight * loss_ca + args.dmd_dm_weight * loss_dm)
 
     return {
@@ -213,8 +255,6 @@ def compute_fake_score_loss(
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
-    use_lora_scales = any(isinstance(sub, StaticMultiLoraLinear) for sub in transformer.modules())
-    fake_scales = make_scales("fake", transformer) if use_lora_scales else None
     clean_latents = generated_latents.detach()
 
     # --- fake-score renoise timestep ---
@@ -237,8 +277,6 @@ def compute_fake_score_loss(
 
     noisy_latents = noisy_latents.to(dtype=model_dtype)
     fake_attn_kwargs = {**(attn_kwargs or {})}
-    if fake_scales is not None:
-        fake_attn_kwargs["lora_scales"] = fake_scales
     fake_pred, _ = transformer(
         hidden_states=noisy_latents,
         timestep=timesteps.to(device=noisy_latents.device, dtype=torch.float32),
@@ -249,7 +287,8 @@ def compute_fake_score_loss(
         joint_attention_kwargs=fake_attn_kwargs,
     )
 
-    fake_loss = F.mse_loss(fake_pred.float(), target_v.float(), reduction="mean") * args.dmd_fake_loss_scale
+    per_sample = F.mse_loss(fake_pred.float(), target_v.float(), reduction="none").mean(dim=(1, 2))
+    fake_loss = per_sample.mean() * args.dmd_fake_loss_scale
 
     return {
         "loss": fake_loss,

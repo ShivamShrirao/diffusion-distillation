@@ -1,4 +1,4 @@
-# Decoupled DMD, 4-step student. LoRA student and fake adapters on one frozen base (the teacher).
+# Decoupled DMD, 4-step student. Full fine-tune: student, fake critic and frozen teacher are separate copies.
 trainer: trainers.dmdr.DDMDRTrainer
 pretrained_model_name_or_path: briaai/Fibo-2.0-dev
 json_data_input_path: data_input.json
@@ -17,13 +17,12 @@ lr_warmup_steps: 100
 max_grad_norm: 1.0
 regional_compile: 1
 checkpointing_steps: 100
-lora_rank: 64
-lora_alpha: 64
 denoising_loss_scale: 0.0
 
 dmd_num_inference_steps: "4"
 dmd_real_guidance_scale: 4.0
 dfake_gen_update_ratio: 5
+teacher_force_prob: 0.0
 
 dmdr_scale: 0.0  # DMDR off; > 0 adds the Qwen3-VL judge loss
 dmdr_prob: 0.5

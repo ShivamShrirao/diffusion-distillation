@@ -3,11 +3,11 @@
 Owns:
   - argparse + accelerator + dtype + seed
   - VAE / transformer / text-encoder construction (via build_*())
-  - LoRA, optimizer, lr_scheduler, dataloader wiring + accelerator.prepare
+  - optimizer, lr_scheduler, dataloader wiring + accelerator.prepare
   - torch.compile, wandb init, resume
   - the outer `for step in range(...)` loop with batch fetching + StopIteration recovery
   - named-loss accumulation across gradient_accumulation_steps + wandb emission
-  - checkpoint saving (LoRA-only or full-state) + optional EMA-LoRA shadow save
+  - checkpoint saving (full state)
 
 Subclasses declare (as class attributes):
   - ``PARSER_MIXINS``        : list of ``add_*_args(parser)`` functions
@@ -41,7 +41,6 @@ import diffusers
 from diffusers.pipelines.bria_fibo2.pipeline_bria_fibo2 import DEFAULT_NEGATIVE_PROMPT
 import torch
 import wandb
-from diffusers.training_utils import cast_training_params
 from tqdm.auto import tqdm
 
 from args.base_args import add_base_args, read_config_defaults
@@ -51,8 +50,7 @@ from data.build import build_dataloader_t2i
 from safetensors.torch import load_file, save_file
 
 from distributed import build_accelerator, compile_transformer, fsdp2_load_full_state, fsdp2_shard_model, set_nccl_env
-from lora.adapters import add_lora
-from train_utils.checkpoint import resolve_resume_checkpoint, write_checkpoint_async
+from train_utils.checkpoint import resolve_resume_checkpoint
 from train_utils.lr_scheduler import build_lr_scheduler
 from train_utils.runtime import (
     CudaTimerContext,
@@ -169,28 +167,15 @@ class BaseTrainer:
         """Load reward / perceptual / ref-transformer models. Default: nothing."""
 
     def configure_transformer(self):
-        """Apply LoRA / adapter setup and dtype-grad masking to ``self.transformer``.
-
-        Runs after ``build_transformer`` returns the bare model (init weights) and before ``accelerator.prepare``. The default handles the standard
-        single-LoRA and no-LoRA paths; DMD overrides
-        this to wire its student/fake dual-adapter setup. Must mutate ``self.transformer``
-        in place — may rewrap it as a ``PeftModel``.
-        """
-        args = self.args
-        if args.lora_rank > 0:
-            logger.info(f"Using LoRA with rank {args.lora_rank}")
-            self.transformer.requires_grad_(False)
-            self.transformer.to(dtype=torch.float32 if args.use_fsdp else self.weight_dtype)
-            self.transformer = add_lora(self.transformer, args.lora_rank)
-            cast_training_params([self.transformer], dtype=torch.float32)
-            self.transformer.print_trainable_parameters()
-        else:
-            self.transformer.requires_grad_(True)
-            assert self.transformer.dtype == torch.float32
+        """Make ``self.transformer`` trainable (full fine-tune, fp32 master weights). Runs after
+        ``build_transformer`` and before ``accelerator.prepare``; DMD overrides this to build its
+        fake critic and frozen teacher."""
+        self.transformer.requires_grad_(True)
+        assert self.transformer.dtype == torch.float32
 
     def post_optimizer_setup(self):
         """Runs after ``accelerator.prepare`` (so FSDP shards exist) and before
-        ``torch.compile``. Use this to instantiate EMA-LoRA shadows or other
+        ``torch.compile``. Use this to instantiate EMA shadows or other
         live-parameter trackers."""
 
     # ---------------------------------------------------------------
@@ -804,57 +789,27 @@ class BaseTrainer:
             return
         self.accelerator.load_state(full_path, map_location="cpu")
 
-    def save_full_transformer(self, save_path: str, writes: list | None = None):
+    def save_full_transformer(self, save_path: str):
         """Gather the full student state dict (collective: all ranks enter) and write
         safetensors + config on rank 0 — the layout ``load_checkpoint_state`` resumes
-        from. With ``writes`` the rank-0 write is appended as a closure for
-        ``write_checkpoint_async`` instead of executing here."""
+        from."""
         state_dict = self.accelerator.get_state_dict(self.transformer, unwrap=False)
         if self.accelerator.is_main_process:
-            unwrapped = self.transformer_unwrapped
-
-            def write(out_dir: str):
-                os.makedirs(out_dir, exist_ok=True)
-                unwrapped.save_config(out_dir)
-                cleaned = {k.replace("module.", "").replace("._orig_mod", ""): v.contiguous() for k, v in state_dict.items()}
-                save_file(cleaned, os.path.join(out_dir, "diffusion_pytorch_model.safetensors"))
-
-            if writes is None:
-                write(save_path)
-            else:
-                writes.append(write)
+            os.makedirs(save_path, exist_ok=True)
+            self.transformer_unwrapped.save_config(save_path)
+            cleaned = {k.replace("module.", "").replace("._orig_mod", ""): v.contiguous() for k, v in state_dict.items()}
+            save_file(cleaned, os.path.join(save_path, "diffusion_pytorch_model.safetensors"))
 
     def save_checkpoint(self):
         save_path = os.path.join(
             self.args.checkpoint_local_path,
             f"checkpoint_{self.global_step:06d}",
         )
-        if self.args.lora_rank > 0:
-            self.accelerator.wait_for_everyone()
-            logger.info(f"Saving LoRA checkpoint to {save_path}")
-            state_dict = self.accelerator.get_state_dict(self.transformer, unwrap=False)
-            state_dict = {k.replace("module.", "").replace("._orig_mod", ""): v for k, v in state_dict.items()}
-            self.transformer_unwrapped.save_pretrained(
-                save_path,
-                state_dict=state_dict,
-                selected_adapters=list(self.transformer_unwrapped.peft_config.keys()),
-                is_main_process=self.accelerator.is_main_process,
-            )
-            del state_dict
-            if self.ema_student is not None:
-                self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped)
-        elif self.is_fsdp2():
+        if self.is_fsdp2():
             # Manually sharded FSDP2 models are not registered with Accelerate, so
             # save_state would silently write nothing for them. Save the gathered
-            # weights explicitly (optimizer state is not saved on this path); the
-            # multi-GB write itself lands in a background thread.
-            writes = []
-            self.save_full_transformer(save_path, writes)
-            if self.accelerator.is_main_process:
-                writes.append(self.copy_data_input_json)
-            write_checkpoint_async(save_path, writes, self.accelerator.is_main_process)
-            logger.info(f"Saving state to {save_path} in the background")
-            return
+            # weights explicitly (optimizer state is not saved on this path).
+            self.save_full_transformer(save_path)
         else:
             self.accelerator.save_state(save_path)
 

@@ -90,8 +90,6 @@ def add_base_args(parser):
     parser.add_argument("--debug", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", type=int, default=0)
     parser.add_argument("--vae_gradient_checkpointing", type=int, default=0)
-    parser.add_argument("--lora_rank", type=int, default=0)
-    parser.add_argument("--lora_alpha", type=int, default=-1, help="LoRA alpha. -1 means use 2 * lora_rank (legacy default).")
     parser.add_argument("--wandb_name", type=str, default="run")
     parser.add_argument("--wandb_project", type=str, default="", help="wandb project; empty = no wandb.")
     parser.add_argument(

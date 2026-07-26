@@ -4,8 +4,8 @@ Few-step distillation for flow-matching text-to-image models.
 
 ## Contents
 
-- **DMD**: decoupled CA + DM loss, fake critic with TTUR (LoRA adapters or full fine-tune)
-- **TDM**: per-segment training, segment-bridge renoise
+- **DMD**: decoupled CA + DM loss, fake critic with TTUR, full fine-tune
+- **TDM**: per-segment training, segment-bridge renoise, pseudo-Huber loss, min-SNR and importance-weighted critic, teacher forcing
 - **DMDR**: Qwen3-VL pairwise judge reward on the student's x0
 - **Edit**: Fibo 2.0 edits through reference images, read by Qwen3-VL and fed to every forward as clean context tokens
 
@@ -20,10 +20,9 @@ trainers/dmd.py          DecoupledDMDT2ITrainer
 trainers/dmdr.py         DDMDRTrainer (DMD + judge reward)
 trainers/dmd_edit.py     DecoupledDMDEditTrainer (edit records)
 reward/                  stock Qwen3-VL pairwise judge
-losses/dmd.py            decoupled DMD loss, fake score loss
+losses/                  decoupled DMD loss, fake score loss, pseudo-Huber
 schedulers/              inference scheduler and timesteps
 models/                  Fibo 2.0 transformer, Qwen3-VL text encoder, VAE
-lora/adapters.py         student and fake LoRA adapters
 train_utils/             packing, checkpoints, LR schedule, runtime
 data/                    webdataset latent shards, per-rank allocation JSON
 ```

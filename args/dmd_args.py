@@ -21,6 +21,15 @@ def add_decoupled_dmd_args(parser):
         help="Number of student generation steps per training iteration.",
     )
     parser.add_argument(
+        "--teacher_force_prob",
+        type=float,
+        default=0.0,
+        help="Per-step probability (shared-RNG, rank-uniform) of teacher-forcing the student "
+        "input PiD-style: skip the no-grad rollout and grad-forward from the GT target latents "
+        "flow-noised to the selected step's timestep, instead of the student's own trajectory "
+        "state. 0 = always roll out from noise (default).",
+    )
+    parser.add_argument(
         "--dmd_mu",
         type=float,
         default=None,
@@ -30,7 +39,7 @@ def add_decoupled_dmd_args(parser):
         "--dmd_fake_loss_scale",
         type=float,
         default=1.0,
-        help="Scale for training the fake LoRA score model on generated samples.",
+        help="Scale for training the fake score model on generated samples.",
     )
     parser.add_argument(
         "--dmd_real_guidance_scale",
@@ -51,6 +60,15 @@ def add_decoupled_dmd_args(parser):
         help="Weight for distribution-matching component.",
     )
     parser.add_argument(
+        "--dmd_pseudo_huber_c",
+        type=float,
+        default=0.0,
+        help="Pseudo-Huber constant c for the generator CA/DM losses (official TDM: 1e-3 via "
+        "--use_huber): loss = mean((sqrt(diff^2 + c^2) - c) / normalizer) on the RAW update, "
+        "replacing MSE on the normalized update. Gives an ~L1 gradient (sign(diff)/norm) once "
+        "|diff| >> c. 0 = MSE (default, unchanged behaviour).",
+    )
+    parser.add_argument(
         "--dfake_gen_update_ratio",
         type=int,
         default=5,
@@ -66,7 +84,7 @@ def add_decoupled_dmd_args(parser):
         "--ema_decay",
         type=float,
         default=0.0,
-        help="EMA decay for the student/fake LoRA shadow. Saved as a side ema/ subdir per checkpoint. 0 disables.",
+        help="EMA decay for the student EMA shadow. Saved as a side ema/ subdir per checkpoint. 0 disables.",
     )
     parser.add_argument(
         "--ema_start_step",
@@ -84,7 +102,23 @@ def add_decoupled_dmd_args(parser):
         "--tdm_segment_renoise",
         type=int,
         default=0,
-        help="TDM segment matching: draw the DM-update and fake-score renoise timestep uniformly WITHIN the selected step's segment [t_{i+1}, t_i] (non-overlapping intervals), instead of uniformly over the full range. 0 = global renoise.",
+        help="TDM segment matching: draw the CA/DM and fake-score renoise timesteps uniformly WITHIN the selected step's segment [t_{i+1}, t_i] (non-overlapping intervals), instead of uniformly over the full range. 0 = global renoise.",
+    )
+    parser.add_argument(
+        "--dmd_fake_min_snr_gamma",
+        type=float,
+        default=0.0,
+        help="Official-TDM critic weighting: min(SNR, gamma) on the x0-space fake-score MSE "
+        "(applied as min((1-sigma)^2, gamma*sigma^2) on our v-space MSE). Official uses 5. "
+        "0 disables (default, unweighted v-MSE).",
+    )
+    parser.add_argument(
+        "--dmd_fake_is_weight",
+        type=int,
+        default=0,
+        help="Official-TDM importance weight on the critic loss: per-sample Gaussian density "
+        "ratio exp(0.5*(mean(fresh^2) - mean(eps_mix^2))) correcting the bridge-renoised sample "
+        "toward the forward-diffusion marginal. 0 disables.",
     )
     parser.add_argument(
         "--fake_lr",

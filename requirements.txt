@@ -2,7 +2,6 @@ torch>=2.7
 accelerate>=1.6
 transformers>=4.57
 diffusers @ git+https://github.com/huggingface/diffusers.git@main
-peft
 webdataset
 datasets
 safetensors

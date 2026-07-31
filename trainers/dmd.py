@@ -21,7 +21,7 @@ from train_utils.packing import pack_t2i
 from train_utils.runtime import CudaTimerContext
 from losses.dmd import add_flow_noise, compute_decoupled_dmd_loss, compute_fake_score_loss
 from train_utils.attention import FA3_BACKEND, build_attention_mask
-from models.transformer import Fibo2Transformer2DModel, build_transformer_config
+from models.transformer import Fibo2Transformer2DModel, build_transformer_config, load_transformer_init_weights
 from models.vae import build_vae, decode_latents, decode_to_images
 from schedulers.flow_matching import build_infer_scheduler, build_infer_timesteps
 from schedulers.inference import predict_flow_step
@@ -48,6 +48,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.fake_transformer_unwrapped = None
         self.real_transformer = None
         self.real_transformer_unwrapped = None
+        self.second_teacher = None
         self.ema_student = None
 
     def extra_setup(self):
@@ -55,6 +56,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         # Seeded from the base seed (NOT the per-rank seed): no collective, no device sync.
         self.shared_rng = torch.Generator().manual_seed(self.args.seed)
         self.infer_scheduler = build_infer_scheduler()
+        a = self.args
+        # Rank-shared teacher coin: every rank calls the same sharded teacher.
+        self.second_teacher_rng = torch.Generator().manual_seed(a.seed + 5)
         if self.args.dmd_log_image_every > 0 or self.args.validate_every > 0:
             self.vae = build_vae(self.args, self.accelerator, self.weight_dtype)
 
@@ -93,6 +97,20 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.fake_transformer_unwrapped = self.fake_transformer
         self.real_transformer_unwrapped = self.real_transformer
 
+        if args.second_teacher_prob > 0:
+            if not args.second_teacher_path:
+                raise ValueError("second_teacher_prob > 0 needs --second_teacher_path")
+            with torch.device("meta"):
+                self.second_teacher = Fibo2Transformer2DModel.from_config(transformer_config)
+            if not args.use_fsdp or self.accelerator.is_main_process:
+                load_transformer_init_weights(self.second_teacher, args.second_teacher_path, logger)
+            self.second_teacher.requires_grad_(False)
+            self.second_teacher.eval()
+            self.second_teacher.set_attention_backend(FA3_BACKEND)
+            if args.gradient_checkpointing:
+                self.second_teacher.enable_gradient_checkpointing()
+            logger.info(f"Loaded frozen second_teacher from {args.second_teacher_path} (prob={args.second_teacher_prob})")
+
         n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.transformer.parameters())
         logger.info(f"Full-FT student trainable params: {n_trainable:,} / {n_total:,}")
@@ -101,6 +119,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.transformer = fsdp2_shard_model(self.transformer, self.accelerator)
         self.fake_transformer = fsdp2_shard_model(self.fake_transformer, self.accelerator)
         self.real_transformer = fsdp2_shard_model(self.real_transformer, self.accelerator)
+        if self.second_teacher is not None:
+            self.second_teacher = fsdp2_shard_model(self.second_teacher, self.accelerator)
 
     def build_optimizer(self):
         student_params = list(self.transformer.parameters())
@@ -134,6 +154,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         if self.args.full_torch_compile or self.args.regional_compile:
             compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, regional=self.args.regional_compile)
             compile_transformer(self.real_transformer, self.real_transformer_unwrapped, regional=self.args.regional_compile)
+            if self.second_teacher is not None:
+                compile_transformer(self.second_teacher, self.second_teacher, regional=self.args.regional_compile)
 
     def is_edit_batch(self, batch) -> bool:
         references = getattr(batch, "references", None)
@@ -153,6 +175,10 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
     def validation_inputs(self, caption: str, height: int, width: int):
         """``(prompt, text-encoder images, context latents)`` of one validation entry; T2I: the caption alone."""
         return caption, None, None
+
+    def second_teacher_coin(self) -> bool:
+        """Rank-shared coin: does this step's real score come from second_teacher?"""
+        return torch.rand((), generator=self.second_teacher_rng).item() < self.args.second_teacher_prob
 
     def prepare_dmd_step(self, batch: T2IBatch) -> dict:
         """Shared step prologue for the DMD trainers: conditioning, packing, attention
@@ -306,6 +332,15 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             "timings": [prep["text_encoder_time"], generate_time[0], prep["mask_time"][0], fetch_time_sec],
         }
 
+    def teacher_branch(self, batch, batch_size: int, device) -> dict:
+        """This step's real teacher and its CFG (the fixed dmd_real_guidance_scale)."""
+        return {"teacher": self.pick_teacher(batch), "guidance": None}
+
+    def pick_teacher(self, batch):
+        """second_teacher on a rank-shared coin, else the real teacher."""
+        use_second = self.second_teacher is not None and self.second_teacher_coin()
+        return self.second_teacher if use_second else self.real_transformer
+
     def _reward_losses(self, batch: T2IBatch, setup: dict, dmd_latents: torch.Tensor):
         """Hook for a reward term on the student's x0 (DMDR); no-op in the base trainer."""
         return None
@@ -327,7 +362,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         dmd_loss = torch.tensor(0.0, device=device)
         student_grad_norm = None
 
-        real_module = self.real_transformer
+        branch = self.teacher_branch(batch, dmd_latents.shape[0], device)
+        real_module = branch["teacher"]
         fake_module = self.fake_transformer
         # 1) Student update — DMD loss (internal fake DM fwd + real teacher fwd).
         if do_gen_update:
@@ -351,6 +387,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 attn_kwargs=joint_attn_kwargs,
                 model_dtype=self.weight_dtype,
                 args=self.args,
+                real_guidance_scale=branch["guidance"],
             )
             dmd_loss = dmd_outputs["loss"]
             dmd_named_losses = dmd_outputs.get("named_losses") or {}
@@ -430,6 +467,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         log_extras = {
             "grad_step_idx": grad_step_idx,
             "teacher_forced": int(teacher_forced),
+            "second_teacher": int(real_module is self.second_teacher),
         }
         if fake_grad_norm is not None:
             log_extras["grad_norm_fake"] = fake_grad_norm

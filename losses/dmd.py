@@ -146,6 +146,7 @@ def compute_decoupled_dmd_loss(
     attn_kwargs: dict,
     model_dtype: torch.dtype,
     args,
+    real_guidance_scale: float | torch.Tensor | None = None,  # scalar or per-record (B, 1, 1)
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
@@ -208,7 +209,8 @@ def compute_decoupled_dmd_loss(
         real_dm_cond_x0 = x0_from_v(dm_noisy, real_dm_cond_v, dm_timesteps, args.noise_max_t)
         fake_dm_cond_x0 = x0_from_v(dm_noisy, fake_dm_cond_v, dm_timesteps, args.noise_max_t)
 
-        ca_update_raw = (args.dmd_real_guidance_scale - 1.0) * (real_ca_cond_x0 - real_ca_uncond_x0)
+        guidance_scale = args.dmd_real_guidance_scale if real_guidance_scale is None else real_guidance_scale
+        ca_update_raw = (guidance_scale - 1.0) * (real_ca_cond_x0 - real_ca_uncond_x0)
         ca_norm = (real_ca_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
         ca_update = ca_update_raw / (ca_norm + 1e-8)
 

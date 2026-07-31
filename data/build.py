@@ -108,6 +108,8 @@ class BucketSpec:
     batch_size: int
     tar_count: int
     token_count: int
+    edit: bool = False
+    weight: float = 1.0
 
     @property
     def batch_token_count(self) -> int:
@@ -136,16 +138,17 @@ class DynamicResolutionScheduler:
 
     @staticmethod
     def _build_groups(buckets: List[BucketSpec]) -> List[List[BucketSpec]]:
-        # Key on (token_count, batch_size), not their product: ranks draw different buckets
-        # from the same group each step, so every bucket in a group must share seq_len and
-        # batch size or cross-rank collectives see mismatched shapes.
+        # Key on (edit, token_count, batch_size), not the token product: ranks draw different
+        # buckets from the same group each step, so every bucket in a group must share the kind
+        # (edit or T2I: every rank runs the same teacher), seq_len and batch size or cross-rank
+        # collectives see mismatched shapes.
         groups: Dict[tuple, List[BucketSpec]] = {}
         for bucket in buckets:
-            groups.setdefault((bucket.token_count, bucket.batch_size), []).append(bucket)
+            groups.setdefault((bucket.edit, bucket.token_count, bucket.batch_size), []).append(bucket)
         return [groups[k] for k in sorted(groups.keys())]
 
     @staticmethod
-    def _allocate_counts(weights: List[int], total_slots: int) -> List[int]:
+    def _allocate_counts(weights: List[float], total_slots: int) -> List[int]:
         if len(weights) > total_slots:
             raise ValueError(f"Cannot allocate {len(weights)} groups into {total_slots} schedule slots")
         weight_sum = sum(weights)
@@ -164,7 +167,7 @@ class DynamicResolutionScheduler:
 
     def _build_group_schedule(self) -> List[int]:
         total_slots = self.schedule_steps
-        group_weights = [sum(b.tar_count for b in group) for group in self.groups]
+        group_weights = [sum(b.tar_count * b.weight for b in group) for group in self.groups]
         counts = self._allocate_counts(group_weights, total_slots)
         schedule = []
         for group_idx, count in enumerate(counts):
@@ -177,11 +180,11 @@ class DynamicResolutionScheduler:
         if len(group) == 1:
             return group[0]
         rng = random.Random(self.seed + 1_000_003 * step + 9_176 * rank)
-        total = sum(bucket.tar_count for bucket in group)
-        pick = rng.randrange(total)
-        running = 0
+        total = sum(bucket.tar_count * bucket.weight for bucket in group)
+        pick = rng.random() * total
+        running = 0.0
         for bucket in group:
-            running += bucket.tar_count
+            running += bucket.tar_count * bucket.weight
             if pick < running:
                 return bucket
         return group[-1]
@@ -291,6 +294,8 @@ def build_dynamic_scheduler(args, vae_config, logger):
                 batch_size=entry.batch_size,
                 tar_count=tar_count,
                 token_count=_latent_token_count(entry.width, entry.height, vae_scale_factor, args.do_patching),
+                edit=entry.edit,
+                weight=entry.weight,
             )
         )
     if not buckets:
@@ -305,6 +310,7 @@ def build_dynamic_scheduler(args, vae_config, logger):
     group_lines = []
     for i, group in enumerate(scheduler.groups):
         resolutions = ", ".join(f"{b.width}x{b.height}@bs{b.batch_size}" for b in group)
+        resolutions = ("edit: " if group[0].edit else "t2i: ") + resolutions
         tar_total = sum(b.tar_count for b in group)
         group_lines.append(f"    [{i}] batch_tokens={group[0].batch_token_count}, tars={tar_total}: {resolutions}")
     logger.info(
@@ -522,7 +528,8 @@ def preprocess_references(images, height: int, width: int):
 
 
 def build_dataloader_edit(args, vae_config, logger) -> Tuple[Callable, int]:
-    """Edit records. An edit record also holds ``reference_images`` (the encoded images to edit) and ``instruction``;
+    """Edit records, and T2I records in the same run (one kind per step, see the scheduler).
+    An edit record also holds ``reference_images`` (the encoded images to edit) and ``instruction``;
     its ``caption``, of the result, is optional."""
 
     def preprocess(record, bucket: BucketSpec):

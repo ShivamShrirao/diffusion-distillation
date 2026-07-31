@@ -4,6 +4,9 @@ Fibo 2.0 edits through reference images: Qwen3-VL reads the images to edit with 
 and their VAE latents join every student, teacher and fake-critic forward as clean context tokens
 (``context_latents``); the velocity covers the generated image only. Rollout, losses, EMA and
 checkpointing are the T2I trainers'.
+
+A run can mix edit and T2I data: every micro-step is one kind on every rank (``data/build.py``).
+Edit steps take the real teacher; T2I steps take second_teacher on its coin.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from trainers.dmd import DecoupledDMDT2ITrainer
 
 
 class DecoupledDMDEditTrainer(DecoupledDMDT2ITrainer):
-    """Decoupled DMD/TDM on edit records."""
+    """Decoupled DMD/TDM on edit and mixed edit + T2I records."""
 
     BATCH_CLS = EditBatch
     DATALOADER_BUILDER = staticmethod(build_dataloader_edit)
@@ -45,6 +48,13 @@ class DecoupledDMDEditTrainer(DecoupledDMDT2ITrainer):
         if not self.is_edit_batch(batch):
             return None
         return [self.encode_references(crops) for crops, _ in batch.references]
+
+    def pick_teacher(self, batch):
+        """Edit steps take the real teacher; T2I steps second_teacher on the rank-shared coin (drawn on T2I
+        steps only), else the real teacher."""
+        if self.is_edit_batch(batch):
+            return self.real_transformer
+        return super().pick_teacher(batch)
 
     def validation_inputs(self, caption: str, height: int, width: int):
         """An entry with ``images`` (paths of the images to edit) is an edit; its other keys are the edit

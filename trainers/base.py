@@ -34,7 +34,7 @@ import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import argparse
 import diffusers
@@ -129,7 +129,7 @@ class BaseTrainer:
         self.total_num_layers: int | None = None
         self.tokenizer = None
         self.text_encoder = None
-        self.get_prompt_embedds: Optional[Callable] = None
+        self.get_prompt_embedds: Callable | None = None
         self.optimizer = []
         self.lr_scheduler = []
         self.get_dataloader = None

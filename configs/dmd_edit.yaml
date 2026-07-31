@@ -1,4 +1,4 @@
-# Decoupled DMD on edits, 4-step student. Edit datasets carry "edit": true in the data JSON.
+# Decoupled DMD on edit and T2I data, 4-step student. Edit datasets carry "edit": true in the data JSON.
 trainer: trainers.dmd_edit.DecoupledDMDEditTrainer
 pretrained_model_name_or_path: briaai/Fibo-2.0-dev
 json_data_input_path: data_input.json
@@ -23,3 +23,5 @@ dmd_num_inference_steps: "4"
 dmd_real_guidance_scale: 4.0
 dfake_gen_update_ratio: 5
 teacher_force_prob: 0.0
+t2i_teacher_path: path/to/second_teacher  # placeholder; used only with t2i_teacher_prob > 0
+t2i_teacher_prob: 0.0  # T2I steps: 1.0 = always t2i_teacher (set t2i_teacher_path); edit steps keep the main teacher

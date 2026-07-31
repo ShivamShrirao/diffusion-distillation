@@ -23,6 +23,8 @@ dmd_num_inference_steps: "4"
 dmd_real_guidance_scale: 4.0
 dfake_gen_update_ratio: 5
 teacher_force_prob: 0.0
+t2i_teacher_path: path/to/second_teacher  # placeholder; used only with t2i_teacher_prob > 0
+t2i_teacher_prob: 0.0  # off
 
 dmdr_scale: 0.0  # DMDR off; > 0 adds the Qwen3-VL judge loss
 dmdr_prob: 0.5

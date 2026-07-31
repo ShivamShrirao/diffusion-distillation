@@ -10,6 +10,8 @@ class ResolutionData:
     height: int
     batch_size: int
     sample_percentage: float = 1.0
+    edit: bool = False  # edit records (reference_images + instruction)
+    weight: float = 1.0  # sampling weight on top of the tar count
 
 
 def dataset_active(value: dict) -> bool:
@@ -21,7 +23,7 @@ def list_resolution_data(json_file: str) -> List[ResolutionData]:
     """Expand the data JSON into per-resolution entries for every active dataset.
 
     All listed resolutions of an active dataset participate; the dataloader weights
-    them by tar count.
+    them by tar count times the dataset's ``weight``. ``edit: true`` marks a dataset of edit records.
     """
     with open(json_file, "r") as f:
         json_data = json.load(f)
@@ -53,6 +55,8 @@ def list_resolution_data(json_file: str) -> List[ResolutionData]:
                     height=height,
                     batch_size=value["batch_size"],
                     sample_percentage=sample_percentage,
+                    edit=bool(value.get("edit", False)),
+                    weight=float(value.get("weight", 1.0)),
                 )
             )
     return out

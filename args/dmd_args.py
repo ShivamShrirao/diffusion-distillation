@@ -47,6 +47,9 @@ def add_decoupled_dmd_args(parser):
         default=5.0,
         help="Guidance scale used for CA real teacher update.",
     )
+    # A second frozen teacher with the main CFG, on a rank-shared per-step coin.
+    parser.add_argument("--t2i_teacher_path", type=str, default=None, help="Second frozen teacher weights (local checkpoint dir).")
+    parser.add_argument("--t2i_teacher_prob", type=float, default=0.0, help="Share of steps whose real score comes from t2i_teacher; 0 = off.")
     parser.add_argument(
         "--dmd_ca_weight",
         type=float,

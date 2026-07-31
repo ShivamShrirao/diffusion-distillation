@@ -87,6 +87,8 @@ def load_transformer_init_weights(transformer, transformer_init: str, logger):
         ckpt_path = f"{transformer_init}/transformer_ema.bin"
     elif os.path.exists(f"{transformer_init}/model.safetensors"):
         ckpt_path = f"{transformer_init}/model.safetensors"
+    elif os.path.exists(f"{transformer_init}/diffusion_pytorch_model.safetensors"):
+        ckpt_path = f"{transformer_init}/diffusion_pytorch_model.safetensors"
     else:
         raise Exception(f"{transformer_init} not found")
 

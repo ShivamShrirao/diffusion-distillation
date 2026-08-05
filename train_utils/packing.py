@@ -1,14 +1,99 @@
-"""Pure-function pack/unpack helpers + CFG dropout helpers.
+"""Pure-function pack/unpack helpers, packed varlen stream layout, CFG dropout helpers.
 
 The pack/unpack functions lay latents out as 2x2-patch tokens, features ordered
 (channel, dy, dx) as the transformer patchifies them. Kept as free functions so
 training code doesn't depend on a pipeline instance.
 """
+from dataclasses import dataclass
 from typing import List
 
 import torch
+from diffusers.models.transformers.transformer_bria_fibo2 import compute_gist_count
 
 from models.text_encoder import pad_embedding
+
+
+@dataclass(frozen=True)
+class Segments:
+    """Offsets of variable-length records on one flat token axis (the varlen kernels' layout)."""
+
+    lengths: list[int]
+    cu_seqlens: torch.Tensor  # [B + 1] int32
+    max_len: int
+
+    @classmethod
+    def from_lengths(cls, lengths: list[int], device) -> "Segments":
+        cu = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+        cu[1:] = torch.tensor(lengths, device=device).cumsum(0)
+        return cls(list(lengths), cu, max(lengths))
+
+
+@dataclass(frozen=True)
+class PackedStream:
+    """One batch packed into a flat stream, record by record ``[gist_i | image_i | context_i]``
+    (Fibo 2.0's order; context: the tokens of an edit record's images to edit). Captions go unpadded
+    and each record attends only within its own segment, so records with different caption lengths
+    (and gist counts) share one forward without padding."""
+
+    text_lengths: list[int]
+    gist_counts: list[int]
+    grid: tuple[int, int]  # image token grid (h, w), the same for every record of the bucket
+    text: Segments
+    joint: Segments
+    context: list | None = None  # per record: the (C, h, w) latents of its images to edit
+
+
+def build_packed_layout(text_mask_after_dropout: torch.Tensor, img_ids: torch.Tensor, config, context=None) -> PackedStream:
+    """Layout from the post-CFG-dropout (B, L) text mask, the image ids, the transformer config and,
+    for edit records, each record's context latents (its images to edit)."""
+    device = text_mask_after_dropout.device
+    text_lengths = text_mask_after_dropout.bool().sum(dim=1).tolist()
+    gist_counts = compute_gist_count(
+        text_lengths, config.min_num_gist_tokens, config.max_num_gist_tokens, config.gist_step,
+        config.gist_min_text_len, config.gist_max_text_len,
+    )
+    grid = (int(img_ids[:, 1].max()) + 1, int(img_ids[:, 2].max()) + 1)
+    num_image_tokens = grid[0] * grid[1]
+    p = config.patch_size
+    context_tokens = [sum((x.shape[-2] // p) * (x.shape[-1] // p) for x in refs) for refs in context or [[]] * len(gist_counts)]
+    return PackedStream(
+        text_lengths=text_lengths,
+        gist_counts=gist_counts,
+        grid=grid,
+        text=Segments.from_lengths(text_lengths, device),
+        joint=Segments.from_lengths([g + num_image_tokens + c for g, c in zip(gist_counts, context_tokens)], device),
+        context=context,
+    )
+
+
+def repeat_context(context, n: int):
+    """Per-record context latents of a batch stacked ``n`` times (CFG-style stacked forwards)."""
+    return None if context is None else context * n
+
+
+def packed_forward(
+    transformer,
+    meta: PackedStream,
+    noisy_target: torch.Tensor,
+    timestep: torch.Tensor,
+    *,
+    text_emb: torch.Tensor,
+    text_layers,
+    text_mask_after_dropout: torch.Tensor,
+    attn_kwargs: dict | None = None,
+):
+    """Packed forward of (B, N, C) target tokens at per-record ``timestep`` (B,) in [0, 1000].
+    The padded captions are flattened to their real tokens; returns ``((B, N, C), None)``."""
+    keep = text_mask_after_dropout.bool()
+    return transformer(
+        hidden_states=noisy_target,
+        timestep=timestep.to(device=noisy_target.device, dtype=torch.float32),
+        encoder_hidden_states=text_emb[keep],
+        text_encoder_layers=[layer[keep] for layer in text_layers],
+        return_dict=False,
+        joint_attention_kwargs=attn_kwargs,
+        packed_stream=meta,
+    )
 
 
 def pack_latents(latents, batch_size, num_channels_latents, height, width):

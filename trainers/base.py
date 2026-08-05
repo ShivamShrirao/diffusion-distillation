@@ -63,10 +63,10 @@ from train_utils.runtime import (
 )
 from losses.denoising import compute_denoising_loss
 from models.text_encoder import build_text_encoder, pad_embedding
-from train_utils.attention import build_attention_mask, diffusers_backend_name, warmup_fa3_kernel
+from train_utils.attention import build_attention_mask, diffusers_backend_name, set_varlen_backend, warmup_fa3_kernel
 from models.transformer import build_transformer
 from models.vae import build_vae_config, vae_scale_factor_from_config, decode_to_images
-from train_utils.packing import apply_cfg_dropout_t2i, pack_t2i, unpack_to_image
+from train_utils.packing import apply_cfg_dropout_t2i, build_packed_layout, pack_t2i, packed_forward, unpack_to_image
 
 
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
@@ -212,6 +212,7 @@ class BaseTrainer:
             if fa3_err is not None:
                 logger.warning(f"FA3 kernel unavailable ({fa3_err}); falling back to attn_backend=native")
                 self.args.attn_backend = "native"
+        set_varlen_backend(self.args.attn_backend)
 
         # Reward / perceptual / ref-transformer models, and the VAE itself for trainers
         # that decode pixels (DMD-with-image-logging). Lives BEFORE the main
@@ -272,6 +273,7 @@ class BaseTrainer:
                 self.transformer,
                 self.transformer_unwrapped,
                 regional=self.args.regional_compile,
+                dynamic=bool(self.args.packed_varlen),
             )
 
         if self.accelerator.is_main_process:
@@ -304,7 +306,8 @@ class BaseTrainer:
         self.transformer.train()
 
     def null_conditioning_for(self, bsz: int, num_text_tokens: int, dtype: torch.dtype | None = None):
-        """Null (empty-prompt) CFG embeddings padded to `num_text_tokens`, sized to `bsz`.
+        """Null (empty-prompt) CFG embeddings padded to `num_text_tokens`, sized to `bsz`,
+        with their (bsz, num_text_tokens) bool text mask.
 
         For explicit-uncond consumers (paired 1:1 with the conditional batch); the
         broadcasting `torch.where` consumers use `self.null_conditioning` directly.
@@ -315,15 +318,15 @@ class BaseTrainer:
         key = (bsz, num_text_tokens, dtype)
         cached = self.null_cond_cache.get(key)
         if cached is None:
-            emb, _ = pad_embedding(self.null_conditioning, max_tokens=num_text_tokens)
-            emb = emb.repeat(bsz, 1, 1)
+            emb, mask = pad_embedding(self.null_conditioning, max_tokens=num_text_tokens)
+            emb, mask = emb.repeat(bsz, 1, 1), mask.bool().repeat(bsz, 1)
             layers = [pad_embedding(layer, max_tokens=num_text_tokens)[0].repeat(bsz, 1, 1) for layer in self.null_conditioning_layers]
             if dtype is not None:
                 emb = emb.to(dtype)
                 layers = [layer.to(dtype) for layer in layers]
             if len(self.null_cond_cache) >= 4:
                 self.null_cond_cache.pop(next(iter(self.null_cond_cache)))
-            cached = self.null_cond_cache[key] = (emb, layers)
+            cached = self.null_cond_cache[key] = (emb, layers, mask)
         return cached
 
     def adamw_kwargs(self):
@@ -412,26 +415,33 @@ class BaseTrainer:
             device,
         )
         mask_time = [0.0]
-        if not prompt_attn_mask.all():
+        attn_mask = packed_stream = None
+        if self.args.packed_varlen:
+            packed_stream = build_packed_layout(prompt_attn_mask, patched_image_ids, self.transformer_unwrapped.config)
+        elif not prompt_attn_mask.all():
             mask_time = []
             with CudaTimerContext(mask_time):
                 attn_mask = build_attention_mask(prompt_attn_mask, patched_noisy.shape[1], self.weight_dtype, self.args.attn_backend)
-        else:
-            attn_mask = None
         joint_attn_kwargs = {"attention_mask": attn_mask}
 
         # ---- forward + denoising loss ----
         forward_time = []
         with CudaTimerContext(forward_time):
-            model_pred, _ = self.transformer(
-                hidden_states=patched_noisy,
-                timestep=timesteps,
-                encoder_hidden_states=eh,
-                text_encoder_layers=te_layers,
-                img_ids=patched_image_ids,
-                return_dict=False,
-                joint_attention_kwargs=joint_attn_kwargs,
-            )
+            if packed_stream is not None:
+                model_pred, _ = packed_forward(
+                    self.transformer, packed_stream, patched_noisy, timesteps,
+                    text_emb=eh, text_layers=te_layers, text_mask_after_dropout=prompt_attn_mask,
+                )
+            else:
+                model_pred, _ = self.transformer(
+                    hidden_states=patched_noisy,
+                    timestep=timesteps,
+                    encoder_hidden_states=eh,
+                    text_encoder_layers=te_layers,
+                    img_ids=patched_image_ids,
+                    return_dict=False,
+                    joint_attention_kwargs=joint_attn_kwargs,
+                )
             model_pred = unpack_to_image(model_pred, height, width, self.vae_scale_factor, self.args.do_patching)
             denoising_loss = compute_denoising_loss(
                 model_pred,

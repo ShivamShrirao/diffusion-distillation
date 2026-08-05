@@ -17,7 +17,7 @@ from data.build import build_dataloader_t2i
 from distributed import compile_transformer, fsdp2_set_reshard_after_forward, fsdp2_shard_model
 from train_utils.ema import FullFtEMA
 from train_utils.checkpoint import resolve_resume_checkpoint
-from train_utils.packing import pack_t2i
+from train_utils.packing import build_packed_layout, pack_t2i
 from train_utils.runtime import CudaTimerContext
 from losses.dmd import add_flow_noise, compute_decoupled_dmd_loss, compute_fake_score_loss
 from train_utils.attention import build_attention_mask, diffusers_backend_name
@@ -154,10 +154,11 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 logger.info(f"Seeded EMA shadow from {ema_fp}")
 
         if self.args.full_torch_compile or self.args.regional_compile:
-            compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, regional=self.args.regional_compile)
-            compile_transformer(self.real_transformer, self.real_transformer_unwrapped, regional=self.args.regional_compile)
+            kwargs = dict(regional=self.args.regional_compile, dynamic=bool(self.args.packed_varlen))
+            compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, **kwargs)
+            compile_transformer(self.real_transformer, self.real_transformer_unwrapped, **kwargs)
             if self.t2i_teacher is not None:
-                compile_transformer(self.t2i_teacher, self.t2i_teacher, regional=self.args.regional_compile)
+                compile_transformer(self.t2i_teacher, self.t2i_teacher, **kwargs)
 
     def is_edit_batch(self, batch) -> bool:
         references = getattr(batch, "references", None)
@@ -202,13 +203,15 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         patched_latents, patched_image_ids = pack_t2i(latents, height, width, self.vae_scale_factor, self.args.do_patching, device)
         latents_seq_len = patched_latents.shape[1]
+        text_mask = prompt_attn_mask.bool()
         mask_time = [0.0]
-        if not prompt_attn_mask.all():
+        attn_mask = packed_stream = None
+        if self.args.packed_varlen:
+            packed_stream = build_packed_layout(text_mask, patched_image_ids, self.transformer_unwrapped.config, context)
+        elif not text_mask.all():
             mask_time = []
             with CudaTimerContext(mask_time):
                 attn_mask = build_attention_mask(prompt_attn_mask, latents_seq_len, self.weight_dtype, self.args.attn_backend)
-        else:
-            attn_mask = None
         joint_attn_kwargs = {"attention_mask": attn_mask}
         if context is not None:
             joint_attn_kwargs["context_latents"] = context
@@ -230,6 +233,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             img_ids=patched_image_ids,
             attn_kwargs=joint_attn_kwargs,
             latents_seq_len=latents_seq_len,
+            packed_stream=packed_stream,
+            text_mask_after_dropout=text_mask,
         )
         return dict(
             height=height,
@@ -240,6 +245,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             patched_latents=patched_latents,
             patched_image_ids=patched_image_ids,
             joint_attn_kwargs=joint_attn_kwargs,
+            packed=[packed_stream, text_mask],
             infer_timesteps=infer_timesteps,
             num_inference_steps=num_inference_steps,
             generated_latents=generated_latents,
@@ -334,6 +340,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             "real_latents": patched_latents,
             "gen_v": gen_v,
             "segments": seg_idx,
+            "packed": prep["packed"],
             "tdm": [prep["num_inference_steps"], seg_lo, seg_hi],
             "timings": [prep["text_encoder_time"], generate_time[0], prep["mask_time"][0], fetch_time_sec],
         }
@@ -365,6 +372,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         teacher_forced = setup["teacher_forced"]
         _, seg_lo, seg_hi = setup.get("tdm", [self.args.dmd_num_inference_steps, None, None])
         gen_v = setup.get("gen_v")
+        packed_stream, text_mask = setup["packed"]
         text_encoder_time, generate_time, mask_time, fetch_time_sec = setup["timings"]
         student_optimizer, fake_optimizer = self.optimizer[0], self.optimizer[1]
         student_lr_scheduler, fake_lr_scheduler = self.lr_scheduler[0], self.lr_scheduler[1]
@@ -381,7 +389,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         if do_gen_update:
             # Only the gen-update losses consume the null (uncond) embeddings; cached, so
             # the ~60-tensor pad+repeat runs once per (bsz, text-len, dtype) bucket.
-            current_null_embeds, current_null_layers = self.null_conditioning_for(
+            current_null_embeds, current_null_layers, current_null_mask = self.null_conditioning_for(
                 eh.shape[0], eh.shape[1], dtype=self.weight_dtype
             )
             dmd_outputs = compute_decoupled_dmd_loss(
@@ -400,6 +408,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 model_dtype=self.weight_dtype,
                 args=self.args,
                 real_guidance_scale=branch["guidance"],
+                packed_stream=packed_stream,
+                text_mask_after_dropout=text_mask,
+                uncond_text_mask=current_null_mask,
             )
             dmd_loss = dmd_outputs["loss"]
             dmd_named_losses = dmd_outputs.get("named_losses") or {}
@@ -445,6 +456,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             seg_hi=seg_hi,
             generated_v=gen_v,
             args=self.args,
+            packed_stream=packed_stream,
+            text_mask_after_dropout=text_mask,
         )
         fake_loss = fake_outputs["loss"]
         fake_named_losses = fake_outputs.get("named_losses") or {}

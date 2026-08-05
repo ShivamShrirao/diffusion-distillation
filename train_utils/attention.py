@@ -6,11 +6,17 @@ Backends (``--attn_backend``):
            Fibo 2.0 builds its own key-padding masks (valid tokens first, padding last), which
            the varlen kernel turns into per-sequence lengths.
 
-The trainers still pass a joint ``(B, 1, S, S)`` bias (text tokens first, then image tokens);
-the Fibo 2.0 wrapper reads the text padding mask off it.
+Padded path: the trainers pass a joint ``(B, 1, S, S)`` bias (text tokens first, then image
+tokens); the Fibo 2.0 wrapper reads the text padding mask off it.
+
+Packed path (``--packed_varlen``): q/k/v are flat ``[tokens, heads, head_dim]`` streams and each
+record attends only within its own segment (``varlen_attention``).
 """
 
+import functools
+
 import torch
+import torch.nn.functional as F
 
 from models.text_encoder import create_attention_matrix
 
@@ -27,16 +33,35 @@ def build_attention_mask(prompt_attn_mask: torch.Tensor, latent_len: int, dtype:
     return create_attention_matrix(valid.to(dtype)).unsqueeze(1)
 
 
-def replicate_attention_mask(mask, n: int):
-    """Batch-replicate a mask for CFG-style batched forwards (e.g. [cond, uncond, dm])."""
-    if mask is None or n == 1:
-        return mask
-    return torch.cat([mask] * n, dim=0)
+VARLEN_BACKEND = "native"
 
 
+def set_varlen_backend(backend: str):
+    """Kernel for the packed path: ``fa3`` (hub kernel) or ``native`` (one SDPA per record)."""
+    global VARLEN_BACKEND
+    VARLEN_BACKEND = backend
+
+
+def varlen_attention(q, k, v, seg_q, seg_k):
+    """Attention of each query segment to its key segment; ``seg_*`` are ``Segments``."""
+    if VARLEN_BACKEND == "fa3":
+        dtype = q.dtype
+        q, k, v = (t.to(torch.bfloat16) for t in (q, k, v))  # the kernel takes 16-bit inputs only
+        out = load_fa3_kernel().flash_attn_varlen_func(
+            q, k, v, seg_q.cu_seqlens, seg_k.cu_seqlens, seg_q.max_len, seg_k.max_len
+        )
+        return (out[0] if isinstance(out, tuple) else out).to(dtype)  # some builds also return the LSE
+    parts = zip(q.split(seg_q.lengths), k.split(seg_k.lengths), v.split(seg_k.lengths))
+    return torch.cat([
+        F.scaled_dot_product_attention(qi.transpose(0, 1), ki.transpose(0, 1), vi.transpose(0, 1)).transpose(0, 1)
+        for qi, ki, vi in parts
+    ])
+
+
+@functools.cache
 def load_fa3_kernel():
-    """Fetch the FA3 hub kernel. ``get_kernel`` with no revision works on older ``kernels``
-    (<0.13); newer versions require an explicit revision and raise ``ValueError``."""
+    """Fetch the FA3 hub kernel (once per process). ``get_kernel`` with no revision works on
+    older ``kernels`` (<0.13); newer versions require an explicit revision and raise ``ValueError``."""
     from kernels import get_kernel
 
     repo = "kernels-community/flash-attn3"

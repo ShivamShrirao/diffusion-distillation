@@ -99,6 +99,7 @@ def add_base_args(parser):
         help="Resume (append) into an existing wandb run id. Empty = fresh run.",
     )
     parser.add_argument("--do_patching", type=int, default=1)
+    parser.add_argument("--packed_varlen", type=int, default=1, help="Flat variable-length streams (unpadded captions, varlen attention); 0 = padded path.")
     parser.add_argument("--full_torch_compile", type=int, default=0)
     parser.add_argument("--regional_compile", type=int, default=0)
     parser.add_argument(

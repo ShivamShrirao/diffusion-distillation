@@ -55,16 +55,6 @@ def pad_embedding(prompt_embeds: torch.Tensor, max_tokens: int):
     return prompt_embeds, attentions_mask
 
 
-def create_attention_matrix(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Build a `(B, S, S)` attention bias (0 = keep, -inf = ignore) from a `(B, S)` mask.
-
-    Preserves the input dtype — pass a bf16 mask to halve the bias's footprint (it is
-    ~S² per sample; the 0/-inf values are exact in any float dtype)."""
-    attention_matrix = torch.einsum("bi,bj->bij", attention_mask, attention_mask)
-    bias = torch.full_like(attention_matrix, -torch.inf)
-    return bias.masked_fill_(attention_matrix == 1, 0.0)
-
-
 def freeze_model(model, device):
     """Put a frozen model on the compute device in eval mode."""
     model = model.to(device)

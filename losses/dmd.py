@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from losses.pseudo_huber import normalized_pseudo_huber_loss
-from train_utils.attention import replicate_attention_mask
+from train_utils.packing import build_packed_layout, packed_forward, repeat_context
 
 
 def add_flow_noise(x0: torch.Tensor, timesteps: torch.Tensor, noise_max_t: int) -> torch.Tensor:
@@ -47,16 +47,6 @@ def add_segment_bridge_noise(
         sigma_t > 0, (a * sigma_lo * (v + x0) + beta * fresh) / sigma_t.clamp(min=1e-8), fresh
     )
     return noisy, eps_mix - x0
-
-
-def replicate_attn_mask(attn_kwargs: dict, n: int) -> dict:
-    out = dict(attn_kwargs or {})
-    am = out.get("attention_mask")
-    if am is not None:
-        out["attention_mask"] = replicate_attention_mask(am, n)
-    if out.get("context_latents") is not None:
-        out["context_latents"] = out["context_latents"] * n
-    return out
 
 
 def sample_decoupled_dmd_timesteps(
@@ -143,10 +133,12 @@ def compute_decoupled_dmd_loss(
     uncond_hidden_states: torch.Tensor,
     uncond_layers,
     img_ids: torch.Tensor,
-    attn_kwargs: dict,
     model_dtype: torch.dtype,
     args,
     real_guidance_scale: float | torch.Tensor | None = None,  # scalar or per-record (B, 1, 1)
+    packed_stream,  # PackedStream of the cond batch
+    text_mask_after_dropout: torch.Tensor,
+    uncond_text_mask: torch.Tensor,
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
@@ -180,29 +172,19 @@ def compute_decoupled_dmd_loss(
         real_timesteps = torch.cat([ca_timesteps, ca_timesteps, dm_timesteps], dim=0)
         real_enc = torch.cat([cond_h, uncond_h, cond_h], dim=0)
         real_layers = [torch.cat([cl, ul, cl], dim=0) for cl, ul in zip(cond_l, uncond_l)]
-        real_attn = replicate_attn_mask(attn_kwargs, 3)
 
-        real_pred, _ = real_transformer(
-            hidden_states=real_latents,
-            timestep=real_timesteps.to(device=real_latents.device, dtype=torch.float32),
-            encoder_hidden_states=real_enc,
-            text_encoder_layers=real_layers,
-            img_ids=img_ids,
-            return_dict=False,
-            joint_attention_kwargs=real_attn,
+        # The uncond views carry the null caption's own length / mask.
+        real_mask = torch.cat([text_mask_after_dropout, uncond_text_mask, text_mask_after_dropout], dim=0)
+        real_pred, _ = packed_forward(
+            real_transformer, build_packed_layout(real_mask, img_ids, real_transformer.config, repeat_context(packed_stream.context, 3)),
+            real_latents, real_timesteps, text_emb=real_enc, text_layers=real_layers,
+            text_mask_after_dropout=real_mask,
+        )
+        fake_dm_cond_v, _ = packed_forward(
+            fake_transformer, packed_stream, dm_noisy.to(dtype=model_dtype), dm_timesteps,
+            text_emb=cond_h, text_layers=cond_l, text_mask_after_dropout=text_mask_after_dropout,
         )
         real_ca_cond_v, real_ca_uncond_v, real_dm_cond_v = real_pred.chunk(3, dim=0)
-
-        fake_attn_kwargs = {**(attn_kwargs or {})}
-        fake_dm_cond_v, _ = fake_transformer(
-            hidden_states=dm_noisy.to(dtype=model_dtype),
-            timestep=dm_timesteps.to(device=dm_noisy.device, dtype=torch.float32),
-            encoder_hidden_states=cond_h,
-            text_encoder_layers=cond_l,
-            img_ids=img_ids,
-            return_dict=False,
-            joint_attention_kwargs=fake_attn_kwargs,
-        )
 
         real_ca_cond_x0 = x0_from_v(ca_noisy, real_ca_cond_v, ca_timesteps, args.noise_max_t)
         real_ca_uncond_x0 = x0_from_v(ca_noisy, real_ca_uncond_v, ca_timesteps, args.noise_max_t)
@@ -247,13 +229,13 @@ def compute_fake_score_loss(
     generated_latents: torch.Tensor,
     cond_hidden_states: torch.Tensor,
     cond_layers,
-    img_ids: torch.Tensor,
-    attn_kwargs: dict,
     model_dtype: torch.dtype,
     seg_lo: float | torch.Tensor | None = None,
     seg_hi: float | torch.Tensor | None = None,
     generated_v: torch.Tensor | None = None,  # detached student velocity; enables TDM bridge renoise
     args=None,
+    packed_stream,
+    text_mask_after_dropout: torch.Tensor,
 ) -> dict:
     batch_size = generated_latents.shape[0]
     device = generated_latents.device
@@ -278,15 +260,11 @@ def compute_fake_score_loss(
         target_v = noise - clean_latents
 
     noisy_latents = noisy_latents.to(dtype=model_dtype)
-    fake_attn_kwargs = {**(attn_kwargs or {})}
-    fake_pred, _ = transformer(
-        hidden_states=noisy_latents,
-        timestep=timesteps.to(device=noisy_latents.device, dtype=torch.float32),
-        encoder_hidden_states=cond_hidden_states.to(dtype=model_dtype),
-        text_encoder_layers=[layer.to(dtype=model_dtype) for layer in cond_layers],
-        img_ids=img_ids,
-        return_dict=False,
-        joint_attention_kwargs=fake_attn_kwargs,
+    cond_h = cond_hidden_states.to(dtype=model_dtype)
+    cond_l = [layer.to(dtype=model_dtype) for layer in cond_layers]
+    fake_pred, _ = packed_forward(
+        transformer, packed_stream, noisy_latents, timesteps,
+        text_emb=cond_h, text_layers=cond_l, text_mask_after_dropout=text_mask_after_dropout,
     )
 
     per_sample = F.mse_loss(fake_pred.float(), target_v.float(), reduction="none").mean(dim=(1, 2))

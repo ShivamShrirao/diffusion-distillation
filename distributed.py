@@ -207,9 +207,9 @@ def fsdp2_load_full_state(model, full_sd: dict):
 def compile_transformer(transformer, transformer_unwrapped, regional: bool = False, **compile_kwargs):
     """Compile the transformer in-place.
 
-    `regional=True` compiles each block runner individually (cheaper recompile on shape
-    changes, checkpoint kept inside the compiled region — see build_block_runners);
-    otherwise the full module is compiled.
+    `regional=True` compiles each block individually (cheaper recompile on shape changes);
+    otherwise the full module is compiled. Packed varlen streams change length every step, so
+    their callers pass ``dynamic=True``.
     """
     torch._dynamo.config.recompile_limit = 64
     if regional:

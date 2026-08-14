@@ -427,10 +427,13 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 student_loss = student_loss + reward_outputs["loss"]
 
             self.accelerator.backward(student_loss)
+            # Step only at the accumulation boundary: raw FSDP2 optimizers do not skip
+            # non-sync micro-steps themselves, so ungated they bypass accumulation and
+            # turn ga into `ga` updates per logged step.
             if self.accelerator.sync_gradients:
                 student_grad_norm = self.clip_grad_norm(self.transformer)
-            student_optimizer.step()
-            student_optimizer.zero_grad()
+                student_optimizer.step()
+                student_optimizer.zero_grad()
             if self.accelerator.sync_gradients and self.ema_student is not None and self.global_step >= self.args.ema_start_step:
                 # Start EMA tracking at ema_start_step: re-seed the shadow from the live student
                 # on the first eligible step so it isn't anchored to the init weights.
@@ -441,7 +444,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 self.ema_student.update()
             dmd_latents = dmd_latents.detach()
 
-        student_lr_scheduler.step()
+        if self.accelerator.sync_gradients:
+            student_lr_scheduler.step()
 
         # 2) Fake score forward (separate, full fake backbone on detached student latents).
         fake_outputs = compute_fake_score_loss(
@@ -471,10 +475,10 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         fake_grad_norm = None
         if self.accelerator.sync_gradients:
             fake_grad_norm = self.clip_grad_norm(fake_module)
-        fake_optimizer.step()
-        fake_lr_scheduler.step()
-        fake_optimizer.zero_grad()
-        student_optimizer.zero_grad()
+            fake_optimizer.step()
+            fake_lr_scheduler.step()
+            fake_optimizer.zero_grad()
+            student_optimizer.zero_grad()
 
         wandb_extras = {}
         log_every = self.args.dmd_log_image_every

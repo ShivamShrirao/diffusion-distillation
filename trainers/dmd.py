@@ -18,7 +18,6 @@ from distributed import compile_transformer, fsdp2_set_reshard_after_forward, fs
 from train_utils.ema import FullFtEMA
 from train_utils.checkpoint import resolve_resume_checkpoint
 from train_utils.packing import build_packed_layout, pack_t2i
-from train_utils.runtime import CudaTimerContext
 from losses.dmd import add_flow_noise, compute_decoupled_dmd_loss, compute_fake_score_loss
 from train_utils.attention import FA3_BACKEND
 from models.transformer import Fibo2Transformer2DModel, build_transformer_config, load_transformer_init_weights
@@ -91,8 +90,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.real_transformer.set_attention_backend(FA3_BACKEND)
 
         if args.gradient_checkpointing:
-            self.fake_transformer.enable_gradient_checkpointing()
-            self.real_transformer.enable_gradient_checkpointing()
+            self.fake_transformer.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
+            self.real_transformer.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
 
         self.fake_transformer_unwrapped = self.fake_transformer
         self.real_transformer_unwrapped = self.real_transformer
@@ -108,7 +107,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.second_teacher.eval()
             self.second_teacher.set_attention_backend(FA3_BACKEND)
             if args.gradient_checkpointing:
-                self.second_teacher.enable_gradient_checkpointing()
+                self.second_teacher.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
             logger.info(f"Loaded frozen second_teacher from {args.second_teacher_path} (prob={args.second_teacher_prob})")
 
         n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
@@ -251,7 +250,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         # Otherwise: one shared segment per step, rollout only up to it.
         per_sample = self.args.tdm_segment_renoise
         generate_time = []
-        with CudaTimerContext(generate_time):
+        with self.cuda_timer(generate_time):
             bsz = generated_latents.shape[0]
             num_steps = len(infer_timesteps)
             if per_sample:

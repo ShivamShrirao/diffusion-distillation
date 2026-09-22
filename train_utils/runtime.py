@@ -55,15 +55,23 @@ class CudaTiming:
 
 
 class CudaTimerContext:
-    def __init__(self, times_arr):
+    """Appends one elapsed time to ``times_arr``; with ``enabled=False`` appends 0.0 and records nothing."""
+
+    def __init__(self, times_arr, enabled=True):
         self.times_arr = times_arr
+        self.enabled = enabled
 
     def __enter__(self):
+        if not self.enabled:
+            return
         self.before_event = torch.cuda.Event(enable_timing=True)
         self.after_event = torch.cuda.Event(enable_timing=True)
         self.before_event.record()
 
     def __exit__(self, type, value, traceback):
+        if not self.enabled:
+            self.times_arr.append(0.0)
+            return
         self.after_event.record()
         self.times_arr.append(CudaTiming(self.before_event, self.after_event))
 

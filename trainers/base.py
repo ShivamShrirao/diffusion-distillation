@@ -62,7 +62,7 @@ from train_utils.runtime import (
     setup_root_logger,
 )
 from losses.denoising import compute_denoising_loss
-from models.text_encoder import build_text_encoder, pad_embedding
+from models.text_encoder import align_layer_count, build_text_encoder, pad_embedding
 from train_utils.attention import FA3_BACKEND, warmup_fa3_kernel
 from models.transformer import build_transformer
 from models.vae import build_vae_config, vae_scale_factor_from_config, decode_to_images
@@ -221,7 +221,7 @@ class BaseTrainer:
         logger.info(f"Transformer Parameters: {self.transformer_param_count / 10**9}B")
         logger.info(f"Trainable transformer Parameters: {trainable_param_count / 10**9}B")
         if self.args.gradient_checkpointing:
-            self.transformer.enable_gradient_checkpointing()
+            self.transformer.enable_gradient_checkpointing(self.args.gradient_checkpoint_first_n_blocks)
         if self.is_fsdp2():
             self.shard_trainable_models()
         logger.info(f"Using precision of {self.weight_dtype}")
@@ -305,7 +305,7 @@ class BaseTrainer:
         if cached is None:
             emb, mask = pad_embedding(self.null_conditioning, max_tokens=num_text_tokens)
             emb, mask = emb.repeat(bsz, 1, 1), mask.bool().repeat(bsz, 1)
-            layers = [pad_embedding(layer, max_tokens=num_text_tokens)[0].repeat(bsz, 1, 1) for layer in self.null_conditioning_layers]
+            layers = [pad_embedding(layer, max_tokens=num_text_tokens)[0].repeat(bsz, 1, 1) for layer in align_layer_count(self.null_conditioning_layers, self.total_num_layers)]
             if dtype is not None:
                 emb = emb.to(dtype)
                 layers = [layer.to(dtype) for layer in layers]
@@ -313,6 +313,10 @@ class BaseTrainer:
                 self.null_cond_cache.pop(next(iter(self.null_cond_cache)))
             cached = self.null_cond_cache[key] = (emb, layers, mask)
         return cached
+
+    def cuda_timer(self, times_arr) -> CudaTimerContext:
+        """Timings are read only from rank 0's sync microstep, so record only there."""
+        return CudaTimerContext(times_arr, enabled=self.accelerator.is_main_process and self.accelerator.sync_gradients)
 
     def adamw_kwargs(self):
         """AdamW kwargs shared by every optimizer (base + DMD student/fake).
@@ -404,7 +408,7 @@ class BaseTrainer:
 
         # ---- forward + denoising loss ----
         forward_time = []
-        with CudaTimerContext(forward_time):
+        with self.cuda_timer(forward_time):
             model_pred, _ = packed_forward(
                 self.transformer, packed_stream, patched_noisy, timesteps,
                 text_emb=eh, text_layers=te_layers, text_mask_after_dropout=prompt_attn_mask,
@@ -601,16 +605,10 @@ class BaseTrainer:
         matches ``total_num_layers``. Subsequent calls are no-ops on it.
         """
         timer = []
-        with CudaTimerContext(timer):
+        with self.cuda_timer(timer):
             eh, te_layers, prompt_attn_mask = self.get_prompt_embedds(captions, images)
-        te_layers = list(te_layers)
-        n = self.total_num_layers
-        if len(te_layers) >= n:
-            te_layers = te_layers[len(te_layers) - n :]
-            self.null_conditioning_layers = self.null_conditioning_layers[len(self.null_conditioning_layers) - n :]
-        else:
-            te_layers = te_layers + [te_layers[-1]] * (n - len(te_layers))
-            self.null_conditioning_layers = self.null_conditioning_layers + [self.null_conditioning_layers[-1]] * (n - len(self.null_conditioning_layers))
+        te_layers = align_layer_count(te_layers, self.total_num_layers)
+        self.null_conditioning_layers = align_layer_count(self.null_conditioning_layers, self.total_num_layers)
         return eh, te_layers, prompt_attn_mask, timer[0]
 
     # ---------------------------------------------------------------

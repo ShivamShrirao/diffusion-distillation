@@ -18,7 +18,6 @@ from distributed import compile_transformer, fsdp2_set_reshard_after_forward, fs
 from train_utils.ema import FullFtEMA
 from train_utils.checkpoint import resolve_resume_checkpoint
 from train_utils.packing import build_packed_layout, pack_t2i
-from train_utils.runtime import CudaTimerContext
 from losses.dmd import add_flow_noise, compute_decoupled_dmd_loss, compute_fake_score_loss
 from train_utils.attention import build_attention_mask, diffusers_backend_name
 from models.transformer import Fibo2Transformer2DModel, build_transformer_config, load_transformer_init_weights
@@ -92,8 +91,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             self.real_transformer.set_attention_backend(diffusers_backend_name(self.args.attn_backend))
 
         if args.gradient_checkpointing:
-            self.fake_transformer.enable_gradient_checkpointing()
-            self.real_transformer.enable_gradient_checkpointing()
+            self.fake_transformer.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
+            self.real_transformer.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
 
         self.fake_transformer_unwrapped = self.fake_transformer
         self.real_transformer_unwrapped = self.real_transformer
@@ -110,7 +109,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             if args.attn_backend != "native":
                 self.t2i_teacher.set_attention_backend(diffusers_backend_name(args.attn_backend))
             if args.gradient_checkpointing:
-                self.t2i_teacher.enable_gradient_checkpointing()
+                self.t2i_teacher.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
             logger.info(f"Loaded frozen t2i_teacher from {args.t2i_teacher_path} (prob={args.t2i_teacher_prob})")
 
         n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
@@ -210,7 +209,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             packed_stream = build_packed_layout(text_mask, patched_image_ids, self.transformer_unwrapped.config, context)
         elif not text_mask.all():
             mask_time = []
-            with CudaTimerContext(mask_time):
+            with self.cuda_timer(mask_time):
                 attn_mask = build_attention_mask(prompt_attn_mask, latents_seq_len, self.weight_dtype, self.args.attn_backend)
         joint_attn_kwargs = {"attention_mask": attn_mask}
         if context is not None:
@@ -266,7 +265,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         # Otherwise: one shared segment per step, rollout only up to it.
         per_sample = self.args.tdm_segment_renoise
         generate_time = []
-        with CudaTimerContext(generate_time):
+        with self.cuda_timer(generate_time):
             bsz = generated_latents.shape[0]
             num_steps = len(infer_timesteps)
             if per_sample:

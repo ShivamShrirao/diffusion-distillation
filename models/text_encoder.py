@@ -45,6 +45,15 @@ def get_qwen3vl_prompt_embeds(
     return bundles[:, 0], hidden_states, attention_mask.long()
 
 
+def align_layer_count(layers: list[torch.Tensor], total_num_layers: int) -> list[torch.Tensor]:
+    """Match a text-encoder hidden-state list to the transformer's block count:
+    keep the last `total_num_layers` layers, or right-pad by repeating the last one."""
+    layers = list(layers)
+    if len(layers) >= total_num_layers:
+        return layers[len(layers) - total_num_layers :]
+    return layers + [layers[-1]] * (total_num_layers - len(layers))
+
+
 def pad_embedding(prompt_embeds: torch.Tensor, max_tokens: int):
     """Right-pad token embeddings up to `max_tokens` and return a matching mask."""
     b, seq_len, dim = prompt_embeds.shape

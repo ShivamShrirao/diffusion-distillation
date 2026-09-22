@@ -89,6 +89,22 @@ class Fibo2Transformer2DModel(BriaFibo2Transformer2DModel):
     def inner_dim(self) -> int:
         return self.config.dim
 
+    def enable_gradient_checkpointing(self, first_n_blocks: int | None = None, **kwargs):
+        """Activation checkpointing on the first ``first_n_blocks`` blocks (noise refiner, then
+        the main stack); the rest keep their activations. None checkpoints every block."""
+        super().enable_gradient_checkpointing(**kwargs)
+        blocks = [*self.noise_refiner, *self.layers]
+        n = len(blocks) if first_n_blocks is None else first_n_blocks
+        for i, block in enumerate(blocks):
+            block.grad_checkpoint = i < n
+        checkpoint = self._gradient_checkpointing_func
+
+        def first_n_checkpoint(block, *args):
+            # A regional-compiled block forwards attribute reads to the original module.
+            return checkpoint(block, *args) if getattr(block, "grad_checkpoint", True) else block(*args)
+
+        self._gradient_checkpointing_func = first_n_checkpoint
+
     def forward(
         self,
         hidden_states,

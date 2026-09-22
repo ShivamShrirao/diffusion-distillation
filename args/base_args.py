@@ -89,6 +89,12 @@ def add_base_args(parser):
     parser.add_argument("--use_fsdp", type=int, default=1)
     parser.add_argument("--debug", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", type=int, default=0)
+    parser.add_argument(
+        "--gradient_checkpoint_first_n_blocks",
+        type=int,
+        default=100,
+        help="With --gradient_checkpointing, checkpoint only the first N transformer blocks (refiner, then main stack).",
+    )
     parser.add_argument("--vae_gradient_checkpointing", type=int, default=0)
     parser.add_argument("--wandb_name", type=str, default="run")
     parser.add_argument("--wandb_project", type=str, default="", help="wandb project; empty = no wandb.")

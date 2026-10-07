@@ -16,11 +16,15 @@ lr_scheduler: constant_with_warmup
 lr_warmup_steps: 100
 max_grad_norm: 1.0
 regional_compile: 1
+fsdp_sharding_strategy: hybrid
 checkpointing_steps: 100
 denoising_loss_scale: 0.0
 
 dmd_num_inference_steps: "4"
 dmd_real_guidance_scale: 4.0
+dmd_real_guidance_min: 3.0  # teacher CFG drawn per record in [3, 5]
+dmd_real_guidance_max: 5.0
+dmd_pdmd: dm
 dfake_gen_update_ratio: 5
 teacher_force_prob: 0.0
 t2i_teacher_path: path/to/second_teacher  # placeholder; used only with t2i_teacher_prob > 0

@@ -254,6 +254,31 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             mask_time=mask_time,
         )
 
+    def _rollout_no_grad(self, generated_latents, infer_timesteps, n_roll, gen_kwargs, per_sample, idx_dev):
+        """Roll the student ``n_roll`` steps under no_grad. Returns ``(latents, gen_input)``;
+        ``gen_input`` is the per-sample segment input (None when not per-sample)."""
+        # Per-sample needs the full rollout (FSDP2 forward counts must agree across ranks).
+        # Hold params gathered across the multi-forward rollout; reshard before the grad forward.
+        hold_unsharded = n_roll > 1 and self.is_fsdp2()
+        if hold_unsharded:
+            fsdp2_set_reshard_after_forward(self.transformer, False)
+        gen_input = None
+        try:
+            with torch.no_grad():
+                # Per-sample: pick each sample's segment input incrementally (sync-free, no
+                # K+1 trajectory stack); seg_idx == 0 keeps the initial latent.
+                if per_sample:
+                    gen_input = generated_latents.clone()
+                for i, t in enumerate(infer_timesteps[:n_roll]):
+                    pred = predict_flow_step(self.transformer, generated_latents, t, **gen_kwargs)
+                    generated_latents = self.infer_scheduler.step(pred, t, generated_latents, return_dict=False)[0]
+                    if per_sample:
+                        gen_input = torch.where((idx_dev == i + 1).view(-1, 1, 1), generated_latents, gen_input)
+        finally:
+            if hold_unsharded:
+                fsdp2_set_reshard_after_forward(self.transformer, True, reshard_now=True)
+        return generated_latents, gen_input
+
     def training_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
         prep = self.prepare_dmd_step(batch)
         device = prep["device"]
@@ -285,30 +310,10 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 and torch.rand(1, generator=self.shared_rng).item() < self.args.teacher_force_prob
             )
 
-            # Per-sample segments need the full rollout (and the forward count must
-            # match across ranks — FSDP2 collectives); the shared segment rolls only up
-            # to it. Keep the student's params gathered across the multi-forward rollout
-            # instead of re-all-gathering the full model every step; weights don't
-            # change inside the loop, and we reshard before the grad forward.
             n_roll = 0 if teacher_forced else (num_steps - 1 if per_sample else int(seg_idx[0]))
-            hold_unsharded = n_roll > 1 and self.is_fsdp2()
-            if hold_unsharded:
-                fsdp2_set_reshard_after_forward(self.transformer, False)
-            try:
-                with torch.no_grad():
-                    # Per-sample: select each sample's rollout input at its segment incrementally
-                    # (sync-free, no K+1 trajectory stack). The latent fed into step i+1 is the
-                    # output of step i; samples with seg_idx == 0 keep the initial latent.
-                    if per_sample:
-                        gen_input = generated_latents.clone()
-                    for i, t in enumerate(infer_timesteps[:n_roll]):
-                        pred = predict_flow_step(self.transformer, generated_latents, t, **gen_kwargs)
-                        generated_latents = self.infer_scheduler.step(pred, t, generated_latents, return_dict=False)[0]
-                        if per_sample:
-                            gen_input = torch.where((idx_dev == i + 1).view(-1, 1, 1), generated_latents, gen_input)
-            finally:
-                if hold_unsharded:
-                    fsdp2_set_reshard_after_forward(self.transformer, True, reshard_now=True)
+            generated_latents, gen_input = self._rollout_no_grad(
+                generated_latents, infer_timesteps, n_roll, gen_kwargs, per_sample, idx_dev
+            )
             if teacher_forced:
                 gen_input = add_flow_noise(patched_latents, t_vec, self.args.noise_max_t)
             elif not per_sample:
@@ -373,8 +378,6 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         gen_v = setup.get("gen_v")
         packed_stream, text_mask = setup["packed"]
         text_encoder_time, generate_time, mask_time, fetch_time_sec = setup["timings"]
-        student_optimizer, fake_optimizer = self.optimizer[0], self.optimizer[1]
-        student_lr_scheduler, fake_lr_scheduler = self.lr_scheduler[0], self.lr_scheduler[1]
 
         named_losses = {}
         dmd_outputs = None
@@ -386,65 +389,12 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         fake_module = self.fake_transformer
         # 1) Student update — DMD loss (internal fake DM fwd + real teacher fwd).
         if do_gen_update:
-            # Only the gen-update losses consume the null (uncond) embeddings; cached, so
-            # the ~60-tensor pad+repeat runs once per (bsz, text-len, dtype) bucket.
-            current_null_embeds, current_null_layers, current_null_mask = self.null_conditioning_for(
-                eh.shape[0], eh.shape[1], dtype=self.weight_dtype
-            )
-            dmd_outputs = compute_decoupled_dmd_loss(
-                generated_latents=dmd_latents,
-                generated_v=gen_v,
-                seg_lo=seg_lo,
-                seg_hi=seg_hi,
-                real_transformer=real_module,
-                fake_transformer=fake_module,
-                cond_hidden_states=eh,
-                cond_layers=te_layers,
-                uncond_hidden_states=current_null_embeds,
-                uncond_layers=current_null_layers,
-                img_ids=patched_image_ids,
-                attn_kwargs=joint_attn_kwargs,
-                model_dtype=self.weight_dtype,
-                args=self.args,
-                real_guidance_scale=branch["guidance"],
-                packed_stream=packed_stream,
-                text_mask_after_dropout=text_mask,
-                uncond_text_mask=current_null_mask,
-            )
+            dmd_outputs, student_grad_norm = self._generator_update(setup, batch, branch, named_losses)
             dmd_loss = dmd_outputs["loss"]
-            dmd_named_losses = dmd_outputs.get("named_losses") or {}
-            named_losses.update(dmd_named_losses)
-            self.record_loss_components({"loss": dmd_loss, "named_losses": dmd_named_losses})
-
-            student_loss = dmd_loss
-
-            reward_outputs = self._reward_losses(batch, setup, dmd_latents)
-            if reward_outputs is not None:
-                reward_named = reward_outputs.get("named_losses") or {}
-                named_losses.update(reward_named)
-                self.record_loss_components({"loss": reward_outputs["loss"].detach(), "named_losses": reward_named})
-                student_loss = student_loss + reward_outputs["loss"]
-
-            self.accelerator.backward(student_loss)
-            # Step only at the accumulation boundary: raw FSDP2 optimizers do not skip
-            # non-sync micro-steps themselves, so ungated they bypass accumulation and
-            # turn ga into `ga` updates per logged step.
-            if self.accelerator.sync_gradients:
-                student_grad_norm = self.clip_grad_norm(self.transformer)
-                student_optimizer.step()
-                student_optimizer.zero_grad()
-            if self.accelerator.sync_gradients and self.ema_student is not None and self.global_step >= self.args.ema_start_step:
-                # Start EMA tracking at ema_start_step: re-seed the shadow from the live student
-                # on the first eligible step so it isn't anchored to the init weights.
-                if not getattr(self, "_ema_seeded", False):
-                    if hasattr(self.ema_student, "reset_to_live"):
-                        self.ema_student.reset_to_live()
-                    self._ema_seeded = True
-                self.ema_student.update()
             dmd_latents = dmd_latents.detach()
 
         if self.accelerator.sync_gradients:
-            student_lr_scheduler.step()
+            self.lr_scheduler[0].step()
 
         # 2) Fake score forward (separate, full fake backbone on detached student latents).
         fake_outputs = compute_fake_score_loss(
@@ -467,29 +417,12 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         named_losses.update(fake_named_losses)
         self.record_loss_components({"loss": fake_loss, "named_losses": fake_named_losses})
 
-        guidance_loss = fake_loss
+        self.accelerator.backward(fake_loss)
+        fake_grad_norm = self._step_fake_optimizer(fake_module)
 
-        self.accelerator.backward(guidance_loss)
-
-        fake_grad_norm = None
-        if self.accelerator.sync_gradients:
-            fake_grad_norm = self.clip_grad_norm(fake_module)
-            fake_optimizer.step()
-            fake_lr_scheduler.step()
-            fake_optimizer.zero_grad()
-            student_optimizer.zero_grad()
-
-        wandb_extras = {}
-        log_every = self.args.dmd_log_image_every
-        if log_every > 0 and self.vae is not None and (self.global_step == 0 or (self.global_step + 1) % log_every == 0):
-            wandb_extras = self._build_image_logs(
-                generated_latents=dmd_latents.detach(),
-                dmd_log_latents=dmd_outputs["log_latents"] if (do_gen_update and dmd_outputs is not None) else None,
-                captions=batch.captions,
-                context_latents=joint_attn_kwargs.get("context_latents"),
-                height=height,
-                width=width,
-            )
+        wandb_extras = self._maybe_build_image_logs(
+            batch, dmd_latents, dmd_outputs, do_gen_update, height, width, setup["cond"][-1].get("context_latents")
+        )
 
         loss = dmd_loss.detach() + fake_loss.detach()
         log_extras = {
@@ -513,6 +446,100 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             "log_extras": log_extras,
             "wandb_extras": wandb_extras,
         }
+
+    def _generator_update(self, setup: dict, batch, branch: dict, named_losses):
+        """Student step: DMD loss (plus the reward hook), backward, optimizer, EMA.
+
+        Returns ``(dmd_outputs, student_grad_norm)``."""
+        eh, te_layers, patched_image_ids, joint_attn_kwargs = setup["cond"]
+        dmd_latents = setup["rollout"][0]
+        _, seg_lo, seg_hi = setup.get("tdm", [self.args.dmd_num_inference_steps, None, None])
+        packed_stream, text_mask = setup["packed"]
+
+        # Null (uncond) embeddings are cached per (bsz, text-len, dtype) bucket.
+        current_null_embeds, current_null_layers, current_null_mask = self.null_conditioning_for(
+            eh.shape[0], eh.shape[1], dtype=self.weight_dtype
+        )
+        dmd_outputs = compute_decoupled_dmd_loss(
+            generated_latents=dmd_latents,
+            generated_v=setup.get("gen_v"),
+            seg_lo=seg_lo,
+            seg_hi=seg_hi,
+            real_transformer=branch["teacher"],
+            fake_transformer=self.fake_transformer,
+            cond_hidden_states=eh,
+            cond_layers=te_layers,
+            uncond_hidden_states=current_null_embeds,
+            uncond_layers=current_null_layers,
+            img_ids=patched_image_ids,
+            attn_kwargs=joint_attn_kwargs,
+            model_dtype=self.weight_dtype,
+            args=self.args,
+            real_guidance_scale=branch["guidance"],
+            packed_stream=packed_stream,
+            text_mask_after_dropout=text_mask,
+            uncond_text_mask=current_null_mask,
+        )
+        dmd_loss = dmd_outputs["loss"]
+        dmd_named_losses = dmd_outputs.get("named_losses") or {}
+        named_losses.update(dmd_named_losses)
+        self.record_loss_components({"loss": dmd_loss, "named_losses": dmd_named_losses})
+
+        student_loss = dmd_loss
+        reward_outputs = self._reward_losses(batch, setup, dmd_latents)
+        if reward_outputs is not None:
+            reward_named = reward_outputs.get("named_losses") or {}
+            named_losses.update(reward_named)
+            self.record_loss_components({"loss": reward_outputs["loss"].detach(), "named_losses": reward_named})
+            student_loss = student_loss + reward_outputs["loss"]
+        self.accelerator.backward(student_loss)
+        # Step only at the accumulation boundary: raw FSDP2 optimizers do not skip non-sync micro-steps.
+        student_grad_norm = None
+        if self.accelerator.sync_gradients:
+            student_grad_norm = self.clip_grad_norm(self.transformer)
+            self.optimizer[0].step()
+            self.optimizer[0].zero_grad()
+        self._maybe_update_ema()
+        return dmd_outputs, student_grad_norm
+
+    def _maybe_update_ema(self):
+        if not (self.accelerator.sync_gradients and self.ema_student is not None and self.global_step >= self.args.ema_start_step):
+            return
+        # Start EMA tracking at ema_start_step: re-seed the shadow from the live student
+        # on the first eligible step so it isn't anchored to the init weights.
+        if not getattr(self, "_ema_seeded", False):
+            if hasattr(self.ema_student, "reset_to_live"):
+                self.ema_student.reset_to_live()
+            self._ema_seeded = True
+        self.ema_student.update()
+
+    def _step_fake_optimizer(self, fake_module):
+        """Clip + step the fake optimizer at the accumulation boundary. Returns the fake grad
+        norm (None off-boundary)."""
+        if not self.accelerator.sync_gradients:
+            return None
+        fake_grad_norm = self.clip_grad_norm(fake_module)
+        self.optimizer[1].step()
+        self.lr_scheduler[1].step()
+        self.optimizer[1].zero_grad()
+        self.optimizer[0].zero_grad()
+        return fake_grad_norm
+
+    def _maybe_build_image_logs(self, batch, dmd_latents, dmd_outputs, do_gen_update, height, width, context_latents=None) -> dict:
+        if not self.accelerator.sync_gradients:
+            return {}
+        log_every = self.args.dmd_log_image_every
+        if not (log_every > 0 and self.vae is not None and (self.global_step == 0 or (self.global_step + 1) % log_every == 0)):
+            return {}
+        dmd_log_latents = dmd_outputs["log_latents"] if (do_gen_update and dmd_outputs is not None) else None
+        return self._build_image_logs(
+            generated_latents=dmd_latents.detach(),
+            dmd_log_latents=dmd_log_latents,
+            captions=batch.captions,
+            context_latents=context_latents,
+            height=height,
+            width=width,
+        )
 
     def load_checkpoint_state(self, full_path: str):
         # student/fake weights are loaded in configure_transformer before the FSDP wrap, so

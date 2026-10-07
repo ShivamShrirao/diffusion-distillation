@@ -11,6 +11,7 @@ import diffusers
 import torch
 import transformers
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
+from accelerate.parallelism_config import ParallelismConfig
 from accelerate.utils import (
     DistributedDataParallelKwargs,
     InitProcessGroupKwargs,
@@ -39,7 +40,7 @@ def build_accelerator(args, weight_dtype):
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    fsdp_plugin = None
+    fsdp_plugin, parallelism_config = None, None
     if args.use_fsdp:
         # cuDNN SDPA backward returns NaN at head_dim=128/bf16 on FSDP2's all-gathered
         # tensors (FSDP1 didn't select it); fall back to flash/mem-efficient.
@@ -56,7 +57,13 @@ def build_accelerator(args, weight_dtype):
             state_dict_type="FULL_STATE_DICT",
         )
         kwargs_handlers = [InitProcessGroupKwargs(timeout=timedelta(1000))]
-        print("Using FSDP2")
+        # HSDP: shard within a node over NVLink, replicate across nodes (only the grad all-reduce
+        # crosses the network).
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", torch.cuda.device_count()))
+        num_nodes = int(os.environ.get("WORLD_SIZE", 1)) // max(local_world, 1)
+        if args.fsdp_sharding_strategy == "hybrid" and num_nodes > 1:
+            parallelism_config = ParallelismConfig(dp_replicate_size=num_nodes, dp_shard_size=local_world)
+        print(f"Using FSDP2 ({f'HSDP {num_nodes}x{local_world}' if parallelism_config else 'full shard'})")
     else:
         kwargs_handlers = [DistributedDataParallelKwargs(find_unused_parameters=False)]
 
@@ -67,6 +74,7 @@ def build_accelerator(args, weight_dtype):
         project_config=accelerator_project_config,
         fsdp_plugin=fsdp_plugin,
         kwargs_handlers=kwargs_handlers,
+        parallelism_config=parallelism_config,
     )
     if fsdp_plugin is not None:
         # The plugin exports FSDP_CPU_RAM_EFFICIENT_LOADING=True, which makes every later

@@ -9,6 +9,9 @@ DMD/DMD2 formulation in x0 space:
 The DM gradient direction is `x0_real - x0_fake` normalised to unit L1
 magnitude (DMD2 weighting trick); the CA gradient direction is
 `(rgs - 1) * (x0_real_cond - x0_real_uncond)` normalised the same way.
+
+PDMD removes from a direction its component along the fake critic's own error
+`x0_fake - x`, per sample.
 """
 
 from __future__ import annotations
@@ -44,9 +47,7 @@ def add_segment_bridge_noise(
     a = (1.0 - sigma_t) / (1.0 - sigma_lo).clamp(min=1e-6)
     beta = (sigma_t.square() - (a * sigma_lo).square()).clamp(min=0.0).sqrt()
     noisy = a * z_lo + beta * fresh
-    eps_mix = torch.where(
-        sigma_t > 0, (a * sigma_lo * (v + x0) + beta * fresh) / sigma_t.clamp(min=1e-8), fresh
-    )
+    eps_mix = torch.where(sigma_t > 0, (a * sigma_lo * (v + x0) + beta * fresh) / sigma_t.clamp(min=1e-8), fresh)
     return noisy, eps_mix - x0, fresh
 
 
@@ -70,14 +71,8 @@ def sample_decoupled_dmd_timesteps(
         hi_sigma = torch.as_tensor(seg_hi, device=device, dtype=torch.float32) / args.noise_max_t
 
         return (
-            (
-                (lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma))
-                * args.noise_max_t
-            ).long().clamp(min=0, max=args.noise_max_t - 1),
-            (
-                (lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma))
-                * args.noise_max_t
-            ).long().clamp(min=0, max=args.noise_max_t - 1),
+            ((lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma)) * args.noise_max_t).long().clamp(min=0, max=args.noise_max_t - 1),
+            ((lo_sigma + torch.rand(batch_size, device=device) * (hi_sigma - lo_sigma)) * args.noise_max_t).long().clamp(min=0, max=args.noise_max_t - 1),
             lo_sigma,
             True,
         )
@@ -102,17 +97,20 @@ def renoise_decoupled_dmd_latents(
     """Prepare the CA and DM teacher inputs using TDM bridge or standard flow noising."""
     if tdm_renoise and generated_v is not None:
         seg_lo = lower_sigma * noise_max_t
-        ca_noisy, _, _ = add_segment_bridge_noise(
-            generated_latents, generated_v, seg_lo, ca_timesteps, noise_max_t
-        )
-        dm_noisy, _, _ = add_segment_bridge_noise(
-            generated_latents, generated_v, seg_lo, dm_timesteps, noise_max_t
-        )
+        ca_noisy, _, _ = add_segment_bridge_noise(generated_latents, generated_v, seg_lo, ca_timesteps, noise_max_t)
+        dm_noisy, _, _ = add_segment_bridge_noise(generated_latents, generated_v, seg_lo, dm_timesteps, noise_max_t)
         return ca_noisy, dm_noisy
     return (
         add_flow_noise(generated_latents, ca_timesteps, noise_max_t),
         add_flow_noise(generated_latents, dm_timesteps, noise_max_t),
     )
+
+
+def project_out(d: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    """Remove from each sample of ``d`` its component along ``r`` (fp32)."""
+    d, r = d.float(), r.float()
+    coef = (d * r).flatten(1).sum(1) / r.square().flatten(1).sum(1).clamp_min(1e-12)
+    return d - coef.view(-1, *([1] * (d.ndim - 1))) * r
 
 
 def dmd_component_loss(
@@ -229,6 +227,20 @@ def compute_decoupled_dmd_loss(
         ca_update = ca_update_raw / (ca_norm + 1e-8)
 
         dm_update_raw = real_dm_cond_x0 - fake_dm_cond_x0
+        # PDMD: the critic error r = x0_fake - x leaks into the DM direction; project it out.
+        critic_err = (fake_dm_cond_x0 - generated_latents).float()
+        pdmd_logs = {
+            "pdmd_cos": F.cosine_similarity(dm_update_raw.float().flatten(1), critic_err.flatten(1), dim=1).mean()
+        }
+        pdmd = getattr(args, "dmd_pdmd", "off")
+        if pdmd != "off":
+            projected = project_out(dm_update_raw, critic_err)
+            removed = 1 - projected.flatten(1).norm(dim=1) / dm_update_raw.float().flatten(1).norm(dim=1).clamp_min(1e-12)
+            pdmd_logs["pdmd_removed"] = removed.mean()
+            dm_update_raw = projected.to(dm_update_raw.dtype)
+            if pdmd == "all":
+                ca_update_raw = project_out(ca_update_raw, critic_err).to(ca_update_raw.dtype)
+                ca_update = ca_update_raw / (ca_norm + 1e-8)
         dm_norm = (real_dm_cond_x0 - generated_latents).abs().mean(dim=(1, 2), keepdim=True)
         dm_update = dm_update_raw / (dm_norm + 1e-8)
 
@@ -246,6 +258,7 @@ def compute_decoupled_dmd_loss(
             "dmd_dm_loss": loss_dm,
             "dmd_ca_norm_mean": ca_norm.mean(),
             "dmd_dm_norm_mean": dm_norm.mean(),
+            **pdmd_logs,
         },
         "log_latents": {
             "dm_update": dm_update.detach(),

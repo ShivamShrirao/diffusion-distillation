@@ -4,11 +4,13 @@ Few-step distillation for flow-matching text-to-image models.
 
 ## Contents
 
-- **DMD**: decoupled CA + DM loss, fake critic with TTUR, full fine-tune; optional second teacher
+- **DMD**: decoupled CA + DM loss, fake critic with TTUR, full fine-tune; per-record teacher CFG; optional second teacher
+- **PDMD**: project the fake critic's error out of the DM direction
 - **TDM**: per-segment training, segment-bridge renoise, pseudo-Huber loss, min-SNR and importance-weighted critic, teacher forcing
 - **DMDR**: Qwen3-VL pairwise judge reward on the student's x0
 - **Edit**: Fibo 2.0 edits through reference images, read by Qwen3-VL and fed to every forward as clean context tokens; edit + T2I runs, one kind per micro-step, per-dataset weights
 - **Packed varlen**: unpadded captions, records packed into one flat stream, varlen attention (FA3)
+- **HSDP**: FSDP2 sharded within a node, replicated across nodes
 
 ## Structure
 

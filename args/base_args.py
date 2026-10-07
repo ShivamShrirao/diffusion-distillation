@@ -87,6 +87,13 @@ def add_base_args(parser):
         help='Path under `--checkpoint_local_path` or "latest".',
     )
     parser.add_argument("--use_fsdp", type=int, default=1)
+    parser.add_argument(
+        "--fsdp_sharding_strategy",
+        type=str,
+        default="hybrid",
+        choices=["hybrid", "full"],
+        help="hybrid = HSDP (shard within a node, replicate across nodes); full = shard over all ranks.",
+    )
     parser.add_argument("--debug", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", type=int, default=0)
     parser.add_argument(

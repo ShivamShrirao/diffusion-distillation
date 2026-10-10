@@ -343,10 +343,10 @@ class BaseTrainer:
             fused=True,
         )
 
-    def build_scheduler(self, optimizer):
+    def build_scheduler(self, optimizer, name: str | None = None):
         # Accelerate-wrapped schedulers step num_processes times per call; raw FSDP2
         # schedulers step once, so their warmup/decay horizons are not pre-multiplied.
-        return build_lr_scheduler(self.args, optimizer, 1 if self.is_fsdp2() else self.accelerator.num_processes)
+        return build_lr_scheduler(self.args, optimizer, 1 if self.is_fsdp2() else self.accelerator.num_processes, name)
 
     def build_optimizer(self):
         parameters = [p for p in self.transformer.parameters() if p.requires_grad]

@@ -9,15 +9,21 @@ wandb_name: dmd
 seed: 42
 mixed_precision: bf16
 debug: 0
-max_train_steps: 1000
+max_train_steps: 400
 gradient_accumulation_steps: 1
-learning_rate: 0.00001
-lr_scheduler: constant_with_warmup
+learning_rate: 0.000005  # student: cosine decay to 0 at max_train_steps
+lr_scheduler: cosine
+fake_lr: 0.00001  # fake: constant after warmup
+fake_lr_scheduler: constant_with_warmup
 lr_warmup_steps: 100
-max_grad_norm: 1.0
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-10
+adam_weight_decay: 0.01
+max_grad_norm: 4.0
 regional_compile: 1
 fsdp_sharding_strategy: hybrid
-checkpointing_steps: 100
+checkpointing_steps: 50
 denoising_loss_scale: 0.0
 
 dmd_num_inference_steps: "4"
@@ -25,7 +31,10 @@ dmd_real_guidance_scale: 4.0
 dmd_real_guidance_min: 3.0  # teacher CFG drawn per record in [3, 5]
 dmd_real_guidance_max: 5.0
 dmd_pdmd: dm
-dfake_gen_update_ratio: 5
+dfake_gen_update_ratio: 3  # 3 fake updates per student update
+ema_decay: 0.95  # power-EMA cap: ~ the last 20 student updates
+ema_power_gamma: 0.75
+ema_start_step: 100
 teacher_force_prob: 0.0
 t2i_teacher_path: path/to/second_teacher  # placeholder; used only with t2i_teacher_prob > 0
 t2i_teacher_prob: 0.0  # off

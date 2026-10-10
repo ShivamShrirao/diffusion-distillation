@@ -132,12 +132,19 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         student_optimizer = torch.optim.AdamW(student_params, lr=self.args.learning_rate, **adamw_kwargs)
         fake_optimizer = torch.optim.AdamW(fake_params, lr=fake_lr, **adamw_kwargs)
         self.optimizer = [student_optimizer, fake_optimizer]
-        self.lr_scheduler = [self.build_scheduler(student_optimizer), self.build_scheduler(fake_optimizer)]
+        # Each schedule advances once per outer step; the fake keeps its own.
+        self.lr_scheduler = [
+            self.build_scheduler(student_optimizer),
+            self.build_scheduler(fake_optimizer, self.args.fake_lr_scheduler or None),
+        ]
 
     def post_optimizer_setup(self):
         if self.args.ema_decay > 0:
-            self.ema_student = FullFtEMA(self.transformer, decay=self.args.ema_decay)
-            logger.info(f"Full-FT student EMA enabled with decay={self.args.ema_decay}, tracking {self.ema_student.local_numel:,} local-shard params per rank")
+            self.ema_student = FullFtEMA(self.transformer, decay=self.args.ema_decay, gamma=self.args.ema_power_gamma)
+            logger.info(
+                f"Full-FT student EMA enabled with decay={self.args.ema_decay} gamma={self.args.ema_power_gamma}, "
+                f"tracking {self.ema_student.local_numel:,} local-shard params per rank"
+            )
             ema_init = dmd_init_path(self.args, "ema")
             ema_fp = os.path.join(ema_init, "diffusion_pytorch_model.safetensors") if ema_init else None
             resume = resolve_resume_checkpoint(self.args)
@@ -150,6 +157,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 # A loaded shadow IS the seed — without this flag the first eligible sync
                 # step would reset_to_live() and silently discard the loaded EMA history.
                 self._ema_seeded = True
+                if resume is not None:  # the power-EMA decay follows the update count
+                    self.ema_student.n_updates = self.ema_updates_until(int(os.path.basename(resume).split("_")[-1]))
                 logger.info(f"Seeded EMA shadow from {ema_fp}")
 
         if self.args.full_torch_compile or self.args.regional_compile:
@@ -158,6 +167,11 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             compile_transformer(self.real_transformer, self.real_transformer_unwrapped, **kwargs)
             if self.t2i_teacher is not None:
                 compile_transformer(self.t2i_teacher, self.t2i_teacher, **kwargs)
+
+    def ema_updates_until(self, step: int) -> int:
+        """Student EMA updates made in global steps [ema_start_step, step): one per student update."""
+        ratio = self.args.dfake_gen_update_ratio
+        return sum(1 for s in range(self.args.ema_start_step, step) if (s + 1) % ratio == 0)
 
     def is_edit_batch(self, batch) -> bool:
         references = getattr(batch, "references", None)
@@ -356,9 +370,19 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             return self.t2i_branch(self.t2i_teacher, batch_size, device)
         return self.main_branch(batch_size, device)
 
+    def per_record_guidance(self, low: float, high: float, batch_size: int, device) -> torch.Tensor:
+        """CFG scales drawn per record, uniform in [low, high], as (B, 1, 1)."""
+        u = torch.rand(batch_size, device=device, generator=self.generator).view(-1, 1, 1)
+        return low + (high - low) * u
+
     def main_branch(self, batch_size: int, device) -> dict:
-        """The main teacher with its CFG."""
-        return {"teacher": self.real_transformer, "guidance": None}
+        """The main teacher with its CFG (dmd_real_guidance_min / max, drawn per record, else the fixed
+        dmd_real_guidance_scale)."""
+        a = self.args
+        guidance = None  # the fixed dmd_real_guidance_scale
+        if a.dmd_real_guidance_min is not None and a.dmd_real_guidance_max is not None:
+            guidance = self.per_record_guidance(a.dmd_real_guidance_min, a.dmd_real_guidance_max, batch_size, device)
+        return {"teacher": self.real_transformer, "guidance": guidance}
 
     def t2i_branch(self, teacher, batch_size: int, device) -> dict:
         """``teacher`` with the main CFG."""

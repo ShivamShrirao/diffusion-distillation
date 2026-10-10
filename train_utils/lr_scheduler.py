@@ -33,8 +33,8 @@ def get_cosine_schedule_with_warmup_and_decay(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def build_lr_scheduler(args, optimizer, step_multiplier: int):
-    name = args.lr_scheduler
+def build_lr_scheduler(args, optimizer, step_multiplier: int, name: str | None = None):
+    name = name or args.lr_scheduler
     num_warmup = args.lr_warmup_steps * step_multiplier
     num_training = args.max_train_steps * step_multiplier
     constant_steps = args.constant_steps * step_multiplier

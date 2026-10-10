@@ -101,7 +101,14 @@ def add_decoupled_dmd_args(parser):
         "--ema_decay",
         type=float,
         default=0.0,
-        help="EMA decay for the student EMA shadow. Saved as a side ema/ subdir per checkpoint. 0 disables.",
+        help="Student EMA decay (the cap of the power EMA) per student update. Saved as a side ema/ subdir per checkpoint. 0 disables.",
+    )
+    parser.add_argument(
+        "--ema_power_gamma",
+        type=float,
+        default=0.0,
+        help="Power EMA (EDM2): update n uses decay min(ema_decay, (1 - 1/(n+1))^(1+gamma)), so the first "
+        "update copies the student and early averages are not dominated by the init. 0 = plain EMA.",
     )
     parser.add_argument(
         "--ema_start_step",
@@ -142,4 +149,10 @@ def add_decoupled_dmd_args(parser):
         type=float,
         default=None,
         help="Learning rate for the fake/guidance optimizer. Defaults to --learning_rate.",
+    )
+    parser.add_argument(
+        "--fake_lr_scheduler",
+        type=str,
+        default="",
+        help="LR schedule of the fake critic, independent of the student's. Empty = --lr_scheduler.",
     )

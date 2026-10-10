@@ -24,20 +24,31 @@ def foreach_lerp_shadow(shadow: list, live: list, alpha: float):
             s.lerp_(t.to(s.dtype), alpha)
 
 
-class FullFtEMA:
-    """EMA over a full-FT student's params. Under FSDP2 each param is a sharded DTensor, so
-    ``local_shard`` keeps every op on the rank-local slice (no collectives). Shadow in float32
-    (decay~0.999 -> alpha 1e-3, below bf16 resolution). ``load_shadow_from`` re-seeds on resume."""
+def power_ema_decay(n_updates: int, cap: float, gamma: float) -> float:
+    """EDM2 power EMA, capped: min(cap, (1 - 1/(n+1))^(gamma+1)); 0 on the first update (a copy).
+    gamma <= 0 is a plain EMA at ``cap``."""
+    if gamma <= 0:
+        return cap
+    return min(cap, (1.0 - 1.0 / (n_updates + 1)) ** (gamma + 1.0))
 
-    def __init__(self, transformer, decay: float):
-        self.decay = decay
+
+class FullFtEMA:
+    """Power EMA over a full-FT student's params. Under FSDP2 each param is a sharded DTensor, so
+    ``local_shard`` keeps every op on the rank-local slice (no collectives). Shadow in float32
+    (decay~0.999 -> alpha 1e-3, below bf16 resolution). ``load_shadow_from`` re-seeds on resume;
+    ``n_updates`` drives the power-EMA decay and is restored with it."""
+
+    def __init__(self, transformer, decay: float, gamma: float = 0.0):
+        self.cap, self.gamma = decay, gamma
+        self.n_updates, self.decay = 0, 0.0
         self.live = list(transformer.parameters())
         self.shadow = [local_shard(p.data).detach().to(torch.float32).clone() for p in self.live]
 
     @torch.no_grad()
     def update(self):
-        alpha = 1.0 - self.decay
-        foreach_lerp_shadow(self.shadow, [local_shard(p.data) for p in self.live], alpha)
+        self.decay = power_ema_decay(self.n_updates, self.cap, self.gamma)
+        foreach_lerp_shadow(self.shadow, [local_shard(p.data) for p in self.live], 1.0 - self.decay)
+        self.n_updates += 1
 
     @torch.no_grad()
     def reset_to_live(self):

@@ -1,5 +1,5 @@
 # Decoupled DMD on edit and T2I data, 4-step student. Edit datasets carry "edit": true in the data JSON.
-trainer: trainers.dmd_edit.DecoupledDMDEditTrainer
+trainer: trainers.dmd_edit.DDMDREditTrainer
 pretrained_model_name_or_path: briaai/Fibo-2.0-dev
 json_data_input_path: data_input.json
 checkpoint_local_path: checkpoints/dmd_edit
@@ -10,7 +10,8 @@ seed: 42
 mixed_precision: bf16
 debug: 0
 max_train_steps: 400
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 2
+dmd_group_order: EDIT,T2I  # one edit, then one T2I micro-step per update
 learning_rate: 0.000005  # student: cosine decay to 0 at max_train_steps
 lr_scheduler: cosine
 fake_lr: 0.00001  # fake: constant after warmup
@@ -38,3 +39,13 @@ ema_start_step: 100
 teacher_force_prob: 0.0
 t2i_teacher_path: path/to/second_teacher  # placeholder; used only with t2i_teacher_prob > 0
 t2i_teacher_prob: 0.0  # T2I steps: 1.0 = always t2i_teacher (set t2i_teacher_path); edit steps keep the main teacher
+
+dmdr_scale: 0.0  # DMDR off; > 0 adds the Qwen3-VL judge loss
+dmdr_prob: 0.5
+dmdr_min_segment: 2
+dmdr_judge: Qwen/Qwen3-VL-8B-Instruct
+dmdr_both_orders: 1  # the stock judge has a strong position bias
+dmdr_groups: T2I,EDIT  # step kinds the judge scores
+dmdr_edit_prompt: edit  # edit steps: the pairwise edit prompt with the record's images to edit
+dmdr_text_scale: 0.0  # e.g. 0.02: exact-text check on records whose caption has text_render
+dmdr_text_prob: 0.7

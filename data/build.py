@@ -125,6 +125,7 @@ class DynamicResolutionScheduler:
         world_size: int,
         seed: int,
         schedule_steps: int,
+        group_order: List[str] | None = None,
     ):
         if not buckets:
             raise ValueError("DynamicResolutionScheduler requires at least one bucket")
@@ -134,7 +135,16 @@ class DynamicResolutionScheduler:
         self.groups = self._build_groups(buckets)
         min_steps = len(self.groups)
         self.schedule_steps = max(1, schedule_steps, min_steps)
-        self.group_schedule = self._build_group_schedule()
+        self.group_schedule = self._build_group_schedule(range(len(self.groups)))
+        # dmd_group_order: micro-step i takes kind group_order[i % len] (EDIT or T2I), each kind
+        # from its own weighted schedule.
+        self.group_order = group_order or []
+        self.kind_schedules = {}
+        for kind in set(self.group_order):
+            indices = [i for i, group in enumerate(self.groups) if group[0].edit == (kind == "EDIT")]
+            if not indices:
+                raise ValueError(f"dmd_group_order has {kind} but the data has no {kind} dataset")
+            self.kind_schedules[kind] = self._build_group_schedule(indices)
 
     @staticmethod
     def _build_groups(buckets: List[BucketSpec]) -> List[List[BucketSpec]]:
@@ -165,12 +175,13 @@ class DynamicResolutionScheduler:
                 counts[idx] += 1
         return counts
 
-    def _build_group_schedule(self) -> List[int]:
+    def _build_group_schedule(self, indices) -> List[int]:
         total_slots = self.schedule_steps
-        group_weights = [sum(b.tar_count * b.weight for b in group) for group in self.groups]
+        indices = list(indices)
+        group_weights = [sum(b.tar_count * b.weight for b in self.groups[i]) for i in indices]
         counts = self._allocate_counts(group_weights, total_slots)
         schedule = []
-        for group_idx, count in enumerate(counts):
+        for group_idx, count in zip(indices, counts):
             schedule.extend([group_idx] * count)
         rng = random.Random(self.seed)
         rng.shuffle(schedule)
@@ -190,7 +201,12 @@ class DynamicResolutionScheduler:
         return group[-1]
 
     def bucket_for_step(self, step: int, rank: int) -> BucketSpec:
-        group_idx = self.group_schedule[step % len(self.group_schedule)]
+        if self.group_order:
+            kind = self.group_order[step % len(self.group_order)]
+            schedule = self.kind_schedules[kind]
+            group_idx = schedule[(step // len(self.group_order)) % len(schedule)]
+        else:
+            group_idx = self.group_schedule[step % len(self.group_schedule)]
         return self._choose_bucket(self.groups[group_idx], step, rank)
 
 
@@ -301,11 +317,18 @@ def build_dynamic_scheduler(args, vae_config, logger):
     if not buckets:
         raise RuntimeError(f"No non-empty dynamic resolution buckets found in {args.json_data_input_path}")
 
+    group_order = [kind.strip() for kind in args.dmd_group_order.split(",") if kind.strip()]
+    if group_order:
+        if any(kind not in ("EDIT", "T2I") for kind in group_order):
+            raise ValueError("dmd_group_order entries must be EDIT or T2I")
+        if len(group_order) != args.gradient_accumulation_steps:
+            raise ValueError("dmd_group_order length must match gradient_accumulation_steps")
     scheduler = DynamicResolutionScheduler(
         buckets=buckets,
         world_size=WORLD_SIZE,
         seed=args.seed,
         schedule_steps=DYNAMIC_RESOLUTION_SCHEDULE_STEPS,
+        group_order=group_order,
     )
     group_lines = []
     for i, group in enumerate(scheduler.groups):

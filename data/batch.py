@@ -19,6 +19,28 @@ class T2IBatch:
         return cls(pixel_values=pixel_values, captions=captions, resolution=resolution)
 
 
+def parse_caption(caption) -> dict | None:
+    """A structured caption as a dict, or None for free text."""
+    if isinstance(caption, dict):
+        return caption
+    try:
+        structured = json.loads(caption)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(structured, dict) and "edit_instruction" in structured:  # an edit prompt: the caption of its result
+        return parse_caption(structured.get("structured_caption"))
+    return structured if isinstance(structured, dict) else None
+
+
+def get_caption_text(caption) -> str | None:
+    """The text the image should show: a structured caption's ``text_render`` entries, joined."""
+    entries = (parse_caption(caption) or {}).get("text_render")
+    if not isinstance(entries, list):
+        return None
+    texts = [e["text"].strip() for e in entries if isinstance(e, dict) and isinstance(e.get("text"), str) and e["text"].strip()]
+    return " ".join(texts) or None
+
+
 def get_caption_short_description(caption):
     """Extract `short_description` from a structured caption; fall back to the raw text."""
     if isinstance(caption, dict):

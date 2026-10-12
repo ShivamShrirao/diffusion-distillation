@@ -20,6 +20,7 @@ from data.build import build_dataloader_edit, preprocess_references
 from models.vae import build_vae, encode_images
 from trainers.base import logger
 from trainers.dmd import DecoupledDMDT2ITrainer
+from trainers.dmdr import DDMDRTrainer
 
 
 class DecoupledDMDEditTrainer(DecoupledDMDT2ITrainer):
@@ -71,3 +72,15 @@ class DecoupledDMDEditTrainer(DecoupledDMDT2ITrainer):
 
     def log_caption_for(self, caption: str) -> str:
         return get_edit_instruction(caption) or super().log_caption_for(caption)
+
+    def judge_references_for(self, batch: EditBatch):
+        """Edit steps with dmdr_edit_prompt "edit": per record, its images to edit as the judge sees them
+        ((3, H, W) in [0, 255])."""
+        if self.args.dmdr_edit_prompt != "edit" or not self.is_edit_batch(batch):
+            return None
+        device = self.accelerator.device
+        return [[((crop[0] + 1) * 127.5).clamp(0, 255).to(device) for crop in crops] for crops, _ in batch.references]
+
+
+class DDMDREditTrainer(DecoupledDMDEditTrainer, DDMDRTrainer):
+    """DMD + DMDR on edit and mixed edit + T2I records; edit steps can take the pairwise edit prompt."""

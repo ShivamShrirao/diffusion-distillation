@@ -8,7 +8,29 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from distributed import fsdp2_shard_frozen
 
-PromptVer = Literal["aesthetic", "aesthetic_with_caption", "caption"]
+PromptVer = Literal["aesthetic", "aesthetic_with_caption", "caption", "edit"]
+
+TEXT_PROMPT = (
+    "You will act as a professional evaluator of text on the generated image.\n"
+    "Evaluate the image solely based on the quality and accuracy of text on it, ignore everything else. "
+    "Generated text on the image must exactly match the requested text, every word and letter, each shown exactly as many times as asked.\n"
+    "The factors to be considered include: text accuracy, text naturalness, text consistency and completeness of text on the image, "
+    "legibility (clean, crisp, easy-to-read letters, no warped or melted glyphs).\n"
+    "Be strict: gibberish, misspelled or unrequested text, and any unasked repetition (a word, letter or line repeated, "
+    "or a requested string shown more times than asked) are as bad as wrong text; any one of them makes the answer 'no'.\n"
+    "Requested text: {text}\n"
+    "Does the image get all of these factors right? Please answer with 'yes' or 'no'."
+)
+
+EDIT_QUESTION = (
+    "Is the FIRST candidate a better edit than the SECOND candidate: it follows the instruction more completely, "
+    "changes nothing that was not asked (a local edit keeps the camera and scene still unless the instruction asks to change them), "
+    "keeps the unique details of every reference object (logo, pattern, shape, colors, face) and renders it faithfully in the scene, "
+    "is physically possible (things rest on and touch each other naturally, correct overlap, nothing impossible), "
+    "is one coherent scene (consistent lighting, shadows, reflections, scale and perspective), "
+    "renders any text exactly as asked (gibberish, misspelled or unrequested text, or any unasked repetition of a word, letter, "
+    "line or string, is as bad as wrong text), has fewer artifacts, and looks better overall? Please answer with 'yes' or 'no'."
+)
 
 
 class Qwen3ImageReward(torch.nn.Module):
@@ -71,27 +93,24 @@ class Qwen3ImageReward(torch.nn.Module):
             "Is image 1 better on these factors than image 2? Please answer with 'yes' or 'no'."
         )
 
-    def get_relative_distribution(
-        self,
-        prompts: List[str],
-        images1: torch.Tensor,
-        images2: torch.Tensor,
-        prompt_ver: PromptVer = "aesthetic_with_caption",
-    ) -> torch.Tensor:
-        """(B, 2) softmax probabilities of answering ``yes`` / ``no`` to "is image 1 better than
-        image 2". Images are (B, 3, H, W) in [0, 255]."""
-        if images1.shape[0] != images2.shape[0]:
-            raise ValueError("images1 and images2 must have the same batch size")
-        get_message_method = getattr(self, f"get_message_relative_image_{prompt_ver}")
-        texts = [
-            self.processor.apply_chat_template(get_message_method(caption), tokenize=False, add_generation_prompt=True)
-            for caption in prompts
+    def get_message_relative_image_edit(self, instruction: str, n_refs: int):
+        """The pairwise edit prompt: the labeled images to edit, the instruction, then the two candidates."""
+        content = [{"type": "text", "text": (
+            "You will act as a professional image editing evaluator.\n"
+            "You are given one or more labeled reference images, an edit instruction, and two edited "
+            "candidates, FIRST and SECOND, both made from the same references and instruction.\n")}]
+        for k in range(n_refs):
+            content += [{"type": "text", "text": f"Reference image_{k + 1}:"}, {"type": "image", "image": None}]
+        content += [
+            {"type": "text", "text": f"Edit instruction: {instruction}"},
+            {"type": "text", "text": "FIRST candidate:"}, {"type": "image", "image": None},
+            {"type": "text", "text": "SECOND candidate:"}, {"type": "image", "image": None},
+            {"type": "text", "text": EDIT_QUESTION},
         ]
-        images = []
-        for i in range(len(images1)):
-            images.append(images1[i])
-            images.append(images2[i])
+        return [{"role": "user", "content": content}]
 
+    def answer_yes_no(self, texts: List[str], images: List[torch.Tensor]) -> torch.Tensor:
+        """(B, 2) softmax probabilities of ``yes`` / ``no`` at each row's last prompt token."""
         inputs = self.processor(text=texts, images=images, videos=None, padding=True, return_tensors="pt")
         inputs = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
         output_logits = self.model(**inputs, return_dict=True, use_cache=False)["logits"]
@@ -102,6 +121,40 @@ class Qwen3ImageReward(torch.nn.Module):
         last_token_logits = output_logits[torch.arange(output_logits.shape[0], device=output_logits.device), last_indices, :]
         probas = torch.nn.functional.softmax(last_token_logits.float(), dim=-1)
         return probas[:, [self.yes_token_id, self.no_token_id]]
+
+    def get_text_probability(self, texts: List[str], images: torch.Tensor) -> torch.Tensor:
+        """(B,) P(yes) / (P(yes) + P(no)) that each image shows exactly its requested text."""
+        def message(text):
+            return [{"role": "user", "content": [{"type": "image", "image": None}, {"type": "text", "text": TEXT_PROMPT.format(text=text)}]}]
+
+        prompts = [self.processor.apply_chat_template(message(t), tokenize=False, add_generation_prompt=True) for t in texts]
+        yes_no = self.answer_yes_no(prompts, list(images))
+        return yes_no[:, 0] / yes_no.sum(dim=-1).clamp_min(1e-8)
+
+    def get_relative_distribution(
+        self,
+        prompts: List[str],
+        images1: torch.Tensor,
+        images2: torch.Tensor,
+        prompt_ver: PromptVer = "aesthetic_with_caption",
+        refs: List[List[torch.Tensor]] | None = None,
+    ) -> torch.Tensor:
+        """(B, 2) softmax probabilities of answering ``yes`` / ``no`` to "is image 1 better than
+        image 2". Images are (B, 3, H, W) in [0, 255]. ``prompt_ver`` "edit": ``prompts`` are edit
+        instructions and ``refs`` each row's images to edit, shown first."""
+        if images1.shape[0] != images2.shape[0]:
+            raise ValueError("images1 and images2 must have the same batch size")
+        if prompt_ver == "edit":
+            messages = [self.get_message_relative_image_edit(p, len(r)) for p, r in zip(prompts, refs)]
+        else:
+            messages = [getattr(self, f"get_message_relative_image_{prompt_ver}")(caption) for caption in prompts]
+        texts = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages]
+        images = []
+        for i in range(len(images1)):
+            images += refs[i] if refs is not None else []
+            images.append(images1[i])
+            images.append(images2[i])
+        return self.answer_yes_no(texts, images)
 
 
 def build_qwen_reward(args, accelerator, weight_dtype) -> Qwen3ImageReward:

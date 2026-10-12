@@ -74,7 +74,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         if not args.use_fsdp or self.accelerator.is_main_process:
             src_sd = self.transformer.state_dict()
-            self.real_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
+            # The frozen teacher is kept in the compute dtype (bf16): no fp32 master copy to hold.
+            self.real_transformer.load_state_dict({k: v.detach().to(self.weight_dtype, copy=True) for k, v in src_sd.items()}, assign=True)
             self.fake_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
             del src_sd
             for t, name in ((self.transformer, "student"), (self.fake_transformer, "fake")):
@@ -85,7 +86,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                     logger.info(f"Loaded full-FT '{name}' from {fp}")
 
         self.fake_transformer.requires_grad_(True)
-        self.real_transformer.requires_grad_(False)
+        self.real_transformer.requires_grad_(False).to(dtype=self.weight_dtype)  # meta on non-zero ranks
         self.fake_transformer.set_attention_backend(FA3_BACKEND)
         self.real_transformer.set_attention_backend(FA3_BACKEND)
 
@@ -103,7 +104,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
                 self.second_teacher = Fibo2Transformer2DModel.from_config(transformer_config)
             if not args.use_fsdp or self.accelerator.is_main_process:
                 load_transformer_init_weights(self.second_teacher, args.second_teacher_path, logger)
-            self.second_teacher.requires_grad_(False)
+            self.second_teacher.requires_grad_(False).to(dtype=self.weight_dtype)
             self.second_teacher.eval()
             self.second_teacher.set_attention_backend(FA3_BACKEND)
             if args.gradient_checkpointing:

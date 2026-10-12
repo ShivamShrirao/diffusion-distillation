@@ -43,3 +43,6 @@ dmdr_scale: 0.0  # DMDR off; > 0 adds the Qwen3-VL judge loss
 dmdr_prob: 0.5
 dmdr_min_segment: 2
 dmdr_judge: Qwen/Qwen3-VL-8B-Instruct
+dmdr_both_orders: 1  # the stock judge has a strong position bias
+dmdr_text_scale: 0.0  # e.g. 0.02: exact-text check on records whose caption has text_render
+dmdr_text_prob: 0.7

@@ -31,3 +31,35 @@ def add_dmdr_args(parser):
         choices=["aesthetic", "aesthetic_with_caption", "caption"],
         help="Judge prompt variant.",
     )
+    parser.add_argument(
+        "--dmdr_both_orders",
+        type=int,
+        default=0,
+        help="1 = ask the pair in both orders in one pass and average the student's wins (cancels the judge's position bias).",
+    )
+    parser.add_argument(
+        "--dmdr_text_scale",
+        type=float,
+        default=0.0,
+        help="Weight of the one-image check that the student renders the caption's text_render exactly; 0 = off.",
+    )
+    parser.add_argument(
+        "--dmdr_text_prob",
+        type=float,
+        default=1.0,
+        help="Share of text records that take the text check instead of the pair (per-rank coin).",
+    )
+    parser.add_argument(
+        "--dmdr_groups",
+        type=str,
+        default="T2I,EDIT",
+        help="Step kinds the judge scores: T2I, EDIT or T2I,EDIT.",
+    )
+    parser.add_argument(
+        "--dmdr_edit_prompt",
+        type=str,
+        default="aesthetic_with_caption",
+        choices=["aesthetic_with_caption", "edit"],
+        help="Edit steps: 'aesthetic_with_caption' = the T2I pair prompt (dmdr_prompt_ver) on the caption of the result; "
+        "'edit' = the pairwise edit prompt with the record's images to edit.",
+    )

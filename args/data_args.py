@@ -20,3 +20,9 @@ def add_data_args(parser):
         default=0,
         help="Use a synthetic random-tensor dataset (no data reads).",
     )
+    parser.add_argument(
+        "--dmd_group_order",
+        type=str,
+        default="",
+        help="Kind of each micro-step of an update, e.g. EDIT,T2I (one per gradient accumulation step); empty = kinds by data weight.",
+    )

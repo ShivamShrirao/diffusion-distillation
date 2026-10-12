@@ -582,6 +582,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             f"checkpoint_{self.global_step:06d}",
         )
         self.accelerator.wait_for_everyone()
+        torch.cuda.empty_cache()  # the full-state gathers stage whole tensors; free cached activations first
         logger.info(f"Saving full-FT DMD checkpoint to {save_path}")
         student_sd = self.accelerator.get_state_dict(self.transformer, unwrap=False)
         fake_sd = self.accelerator.get_state_dict(self.fake_transformer, unwrap=False)

@@ -813,6 +813,7 @@ class BaseTrainer:
             self.args.checkpoint_local_path,
             f"checkpoint_{self.global_step:06d}",
         )
+        torch.cuda.empty_cache()  # the full-state gather stages whole tensors; free cached activations first
         if self.is_fsdp2():
             # Manually sharded FSDP2 models are not registered with Accelerate, so
             # save_state would silently write nothing for them. Save the gathered

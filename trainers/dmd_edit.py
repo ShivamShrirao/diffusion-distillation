@@ -31,6 +31,8 @@ class DecoupledDMDEditTrainer(DecoupledDMDT2ITrainer):
 
     def extra_setup(self):
         super().extra_setup()
+        if self.route_views:
+            raise ValueError("edit runs pick the teacher per step kind; set t2i_teacher_segments and t2i_teacher_below_sigma to 0")
         if self.vae is None:  # encodes the images to edit
             self.vae = build_vae(self.args, self.accelerator, self.weight_dtype)
         logger.info("DMD-edit: the images to edit join every forward as context tokens")

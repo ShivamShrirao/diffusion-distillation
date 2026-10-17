@@ -4,7 +4,7 @@ Few-step distillation for flow-matching text-to-image models.
 
 ## Contents
 
-- **DMD**: decoupled CA + DM loss, fake critic with TTUR, full fine-tune, bf16 frozen teachers; per-record teacher CFG; optional second teacher
+- **DMD**: decoupled CA + DM loss, fake critic with TTUR, full fine-tune, bf16 frozen teachers; per-record teacher CFG; optional second teacher, by coin or routed per segment / below a noise level
 - **PDMD**: project the fake critic's error out of the DM direction
 - **TDM**: per-segment training, segment-bridge renoise, pseudo-Huber loss, min-SNR and importance-weighted critic, teacher forcing
 - **DMDR**: Qwen3-VL pairwise judge reward on the student's x0, both pair orders, exact-text check

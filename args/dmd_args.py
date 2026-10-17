@@ -64,6 +64,21 @@ def add_decoupled_dmd_args(parser):
     # A second frozen teacher with the main CFG, on a rank-shared per-step coin.
     parser.add_argument("--t2i_teacher_path", type=str, default=None, help="Second frozen teacher weights (local checkpoint dir).")
     parser.add_argument("--t2i_teacher_prob", type=float, default=0.0, help="Share of steps whose real score comes from t2i_teacher; 0 = off.")
+    # Per-view routing off the coin: single real-teacher views (CA cond, CA uncond, DM cond) take t2i_teacher.
+    parser.add_argument(
+        "--t2i_teacher_segments",
+        type=int,
+        default=0,
+        help="Records in TDM segments below this index (0 = the noisiest) take t2i_teacher; 0 = off.",
+    )
+    parser.add_argument(
+        "--t2i_teacher_segment_frac",
+        type=float,
+        default=1.0,
+        help="...only for views whose noise level is in this noisiest fraction of the record's segment.",
+    )
+    parser.add_argument("--t2i_teacher_below_sigma", type=float, default=0.0, help="Views below this sigma take t2i_teacher; 0 = off.")
+    parser.add_argument("--t2i_teacher_below_sigma_prob", type=float, default=1.0, help="...each with this probability.")
     parser.add_argument(
         "--dmd_ca_weight",
         type=float,

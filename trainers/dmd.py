@@ -58,6 +58,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         a = self.args
         # Rank-shared teacher coin: every rank calls the same sharded teacher.
         self.t2i_teacher_rng = torch.Generator().manual_seed(a.seed + 5)
+        # Per-rank view draws: they never change which forwards run, so ranks need not agree.
+        self.view_rng = torch.Generator().manual_seed(a.seed + 6 + 1000 * self.accelerator.process_index)
+        self.route_views = a.t2i_teacher_segments > 0 or a.t2i_teacher_below_sigma > 0
         if self.args.dmd_log_image_every > 0 or self.args.validate_every > 0:
             self.vae = build_vae(self.args, self.accelerator, self.weight_dtype)
 
@@ -98,9 +101,9 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.fake_transformer_unwrapped = self.fake_transformer
         self.real_transformer_unwrapped = self.real_transformer
 
-        if args.t2i_teacher_prob > 0:
+        if args.t2i_teacher_prob > 0 or self.route_views:
             if not args.t2i_teacher_path:
-                raise ValueError("t2i_teacher_prob > 0 needs --t2i_teacher_path")
+                raise ValueError("t2i_teacher_prob / t2i_teacher_segments / t2i_teacher_below_sigma need --t2i_teacher_path")
             with torch.device("meta"):
                 self.t2i_teacher = Fibo2Transformer2DModel.from_config(transformer_config)
             if not args.use_fsdp or self.accelerator.is_main_process:
@@ -389,6 +392,28 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         """``teacher`` with the main CFG."""
         return {**self.main_branch(batch_size, device), "teacher": teacher}
 
+    def second_teacher_kwargs(self, branch: dict, segments, seg_lo, seg_hi) -> dict:
+        """Per-view t2i_teacher routing for the DMD loss, when on and the coin kept the main teacher."""
+        if not self.route_views or branch["teacher"] is not self.real_transformer:
+            return {}
+        return {
+            "second_teacher": self.t2i_teacher,
+            "second_teacher_route": lambda timesteps: self.t2i_teacher_views(segments, seg_lo, seg_hi, timesteps),
+        }
+
+    def t2i_teacher_views(self, segments, seg_lo, seg_hi, timesteps):
+        """Which of the 3B real-teacher views (CA cond, CA uncond, DM cond at ``timesteps``) take
+        t2i_teacher off the coin: views of records in segments < t2i_teacher_segments whose level lies in
+        the noisiest t2i_teacher_segment_frac of the segment, and views below t2i_teacher_below_sigma
+        (each with probability t2i_teacher_below_sigma_prob)."""
+        a, device, n = self.args, timesteps.device, len(segments)
+        lo = torch.as_tensor(seg_lo, device=device, dtype=torch.float32).expand(n).repeat(3)
+        hi = torch.as_tensor(seg_hi, device=device, dtype=torch.float32).expand(n).repeat(3)
+        t = timesteps.float()
+        by_segment = (segments.to(device) < a.t2i_teacher_segments).repeat(3) & (t >= hi - a.t2i_teacher_segment_frac * (hi - lo))
+        draw = torch.rand(len(t), generator=self.view_rng).to(device) < a.t2i_teacher_below_sigma_prob
+        return by_segment | ((t < a.t2i_teacher_below_sigma * a.noise_max_t) & draw)
+
     def _reward_losses(self, batch: T2IBatch, setup: dict, dmd_latents: torch.Tensor):
         """Hook for a reward term on the student's x0 (DMDR); no-op in the base trainer."""
         return None
@@ -504,6 +529,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             packed_stream=packed_stream,
             text_mask_after_dropout=text_mask,
             uncond_text_mask=current_null_mask,
+            **self.second_teacher_kwargs(branch, setup["segments"], seg_lo, seg_hi),
         )
         dmd_loss = dmd_outputs["loss"]
         dmd_named_losses = dmd_outputs.get("named_losses") or {}

@@ -149,6 +149,8 @@ def compute_decoupled_dmd_loss(
     packed_stream=None,  # PackedStream of the cond batch; None = padded path
     text_mask_after_dropout: torch.Tensor | None = None,
     uncond_text_mask: torch.Tensor | None = None,
+    second_teacher=None,  # with second_teacher_route: per-view routing of the real forward
+    second_teacher_route=None,  # (3B,) timesteps -> (3B,) bool, True = take second_teacher's view
 ) -> dict:
     batch_size, seq_len = generated_latents.shape[:2]
     device = generated_latents.device
@@ -186,17 +188,15 @@ def compute_decoupled_dmd_loss(
         # The uncond views carry the null caption's own length / mask.
         real_mask = torch.cat([text_mask_after_dropout, uncond_text_mask, text_mask_after_dropout], dim=0)
         if packed_stream is not None:
-            real_pred, _ = packed_forward(
-                real_transformer, build_packed_layout(real_mask, img_ids, real_transformer.config, repeat_context(packed_stream.context, 3)),
-                real_latents, real_timesteps, text_emb=real_enc, text_layers=real_layers,
-                text_mask_after_dropout=real_mask,
-            )
-            fake_dm_cond_v, _ = packed_forward(
-                fake_transformer, packed_stream, dm_noisy.to(dtype=model_dtype), dm_timesteps,
-                text_emb=cond_h, text_layers=cond_l, text_mask_after_dropout=text_mask_after_dropout,
-            )
-        else:
-            real_pred, _ = real_transformer(
+            real_layout = build_packed_layout(real_mask, img_ids, real_transformer.config, repeat_context(packed_stream.context, 3))
+
+        def real_forward(teacher):
+            if packed_stream is not None:
+                return packed_forward(
+                    teacher, real_layout, real_latents, real_timesteps, text_emb=real_enc, text_layers=real_layers,
+                    text_mask_after_dropout=real_mask,
+                )[0]
+            return teacher(
                 hidden_states=real_latents,
                 timestep=real_timesteps.to(device=real_latents.device, dtype=torch.float32),
                 encoder_hidden_states=real_enc,
@@ -204,7 +204,22 @@ def compute_decoupled_dmd_loss(
                 img_ids=img_ids,
                 return_dict=False,
                 joint_attention_kwargs=padded_attn_kwargs(real_mask, seq_len, model_dtype, args, repeat_context((attn_kwargs or {}).get("context_latents"), 3)),
+            )[0]
+
+        real_pred = real_forward(real_transformer)
+        route_logs = {}
+        if second_teacher is not None:
+            # One extra batched forward (on every rank: the teachers are sharded); pick per view.
+            use = second_teacher_route(real_timesteps)
+            real_pred = torch.where(use.view(-1, 1, 1), real_forward(second_teacher), real_pred)
+            route_logs["t2i_teacher_share"] = use.float().mean()
+
+        if packed_stream is not None:
+            fake_dm_cond_v, _ = packed_forward(
+                fake_transformer, packed_stream, dm_noisy.to(dtype=model_dtype), dm_timesteps,
+                text_emb=cond_h, text_layers=cond_l, text_mask_after_dropout=text_mask_after_dropout,
             )
+        else:
             fake_dm_cond_v, _ = fake_transformer(
                 hidden_states=dm_noisy.to(dtype=model_dtype),
                 timestep=dm_timesteps.to(device=dm_noisy.device, dtype=torch.float32),
@@ -259,6 +274,7 @@ def compute_decoupled_dmd_loss(
             "dmd_ca_norm_mean": ca_norm.mean(),
             "dmd_dm_norm_mean": dm_norm.mean(),
             **pdmd_logs,
+            **route_logs,
         },
         "log_latents": {
             "dm_update": dm_update.detach(),

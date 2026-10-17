@@ -37,8 +37,12 @@ ema_decay: 0.95  # power-EMA cap: ~ the last 20 student updates
 ema_power_gamma: 0.75
 ema_start_step: 100
 teacher_force_prob: 0.0
-t2i_teacher_path: path/to/second_teacher  # placeholder; used only with t2i_teacher_prob > 0
+t2i_teacher_path: path/to/second_teacher  # placeholder; used only when t2i_teacher is on
 t2i_teacher_prob: 0.0  # T2I steps: 1.0 = always t2i_teacher (set t2i_teacher_path); edit steps keep the main teacher
+t2i_teacher_segments: 0  # off; e.g. 1 = the noisiest segment's views take t2i_teacher
+t2i_teacher_segment_frac: 1.0
+t2i_teacher_below_sigma: 0.0  # off
+t2i_teacher_below_sigma_prob: 1.0
 
 dmdr_scale: 0.0  # DMDR off; > 0 adds the Qwen3-VL judge loss
 dmdr_prob: 0.5

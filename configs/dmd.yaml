@@ -22,11 +22,15 @@ adam_epsilon: 1.0e-10
 adam_weight_decay: 0.01
 max_grad_norm: 4.0
 regional_compile: 1
+attn_backend: fa3
+gradient_checkpointing: 1
+gradient_checkpoint_first_n_blocks: 44
 fsdp_sharding_strategy: hybrid
 checkpointing_steps: 50
 denoising_loss_scale: 0.0
 
 dmd_num_inference_steps: "4"
+tdm_segment_renoise: 1  # one random segment per record
 dmd_real_guidance_scale: 4.0
 dmd_real_guidance_min: 3.0  # teacher CFG drawn per record in [3, 5]
 dmd_real_guidance_max: 5.0
@@ -35,7 +39,7 @@ dfake_gen_update_ratio: 3  # 3 fake updates per student update
 ema_decay: 0.95  # power-EMA cap: ~ the last 20 student updates
 ema_power_gamma: 0.75
 ema_start_step: 100
-teacher_force_prob: 0.0
+teacher_force_prob: 0.5
 t2i_teacher_path: path/to/second_teacher  # placeholder; used only when t2i_teacher is on
 t2i_teacher_prob: 0.0  # off
 t2i_teacher_segments: 0  # off; e.g. 1 = the noisiest segment's views take t2i_teacher

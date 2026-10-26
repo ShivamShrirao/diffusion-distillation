@@ -39,6 +39,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
     PARSER_MIXINS = [add_base_args, add_data_args, add_decoupled_dmd_args]
     BATCH_CLS = T2IBatch
     DATALOADER_BUILDER = staticmethod(build_dataloader_t2i)
+    has_fake_critic = True  # False (SMD): no fake transformer is built, trained or saved
 
     def __init__(self):
         super().__init__()
@@ -66,37 +67,40 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
     def configure_transformer(self):
         args = self.args
-        logger.info("Using DMD full fine-tune mode: cloning student into fake + real transformers")
+        logger.info("Using DMD full fine-tune mode: cloning the student into the trainable copies and the real teacher")
         self.transformer.requires_grad_(True)
         assert self.transformer.dtype == torch.float32
 
         transformer_config = build_transformer_config(args, self.vae_config, logger)
         with torch.device("meta"):
-            self.fake_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
+            if self.has_fake_critic:
+                self.fake_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
             self.real_transformer = Fibo2Transformer2DModel.from_config(transformer_config)
 
         if not args.use_fsdp or self.accelerator.is_main_process:
             src_sd = self.transformer.state_dict()
             # The frozen teacher is kept in the compute dtype (bf16): no fp32 master copy to hold.
             self.real_transformer.load_state_dict({k: v.detach().to(self.weight_dtype, copy=True) for k, v in src_sd.items()}, assign=True)
-            self.fake_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
+            if self.fake_transformer is not None:
+                self.fake_transformer.load_state_dict({k: v.detach().clone() for k, v in src_sd.items()}, assign=True)
             del src_sd
-            for t, adapter in ((self.transformer, "student"), (self.fake_transformer, "fake")):
+            for t, adapter in self.trainable_copies():
                 p = dmd_init_path(args, adapter)
                 fp = os.path.join(p, "diffusion_pytorch_model.safetensors") if p else None
                 if fp and os.path.exists(fp):
                     t.load_state_dict(load_file(fp), assign=True)
                     logger.info(f"Loaded full-FT '{adapter}' from {fp}")
 
-        self.fake_transformer.requires_grad_(True)
         self.real_transformer.requires_grad_(False).to(dtype=self.weight_dtype)  # meta on non-zero ranks
-        if self.args.attn_backend != "native":
-            self.fake_transformer.set_attention_backend(diffusers_backend_name(self.args.attn_backend))
-            self.real_transformer.set_attention_backend(diffusers_backend_name(self.args.attn_backend))
-
-        if args.gradient_checkpointing:
-            self.fake_transformer.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
-            self.real_transformer.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
+        for model in (self.fake_transformer, self.real_transformer):
+            if model is None:
+                continue
+            if self.args.attn_backend != "native":
+                model.set_attention_backend(diffusers_backend_name(self.args.attn_backend))
+            if args.gradient_checkpointing:
+                model.enable_gradient_checkpointing(args.gradient_checkpoint_first_n_blocks)
+        if self.fake_transformer is not None:
+            self.fake_transformer.requires_grad_(True)
 
         self.fake_transformer_unwrapped = self.fake_transformer
         self.real_transformer_unwrapped = self.real_transformer
@@ -120,9 +124,17 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         n_total = sum(p.numel() for p in self.transformer.parameters())
         logger.info(f"Full-FT student trainable params: {n_trainable:,} / {n_total:,}")
 
+    def trainable_copies(self):
+        """(model, checkpoint subdir) of the trainable transformers: the student and the fake critic."""
+        copies = [(self.transformer, "student")]
+        if self.fake_transformer is not None:
+            copies.append((self.fake_transformer, "fake"))
+        return copies
+
     def shard_trainable_models(self):
         self.transformer = fsdp2_shard_model(self.transformer, self.accelerator)
-        self.fake_transformer = fsdp2_shard_model(self.fake_transformer, self.accelerator)
+        if self.fake_transformer is not None:
+            self.fake_transformer = fsdp2_shard_model(self.fake_transformer, self.accelerator)
         self.real_transformer = fsdp2_shard_model(self.real_transformer, self.accelerator)
         if self.t2i_teacher is not None:
             self.t2i_teacher = fsdp2_shard_model(self.t2i_teacher, self.accelerator)
@@ -167,7 +179,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         if self.args.full_torch_compile or self.args.regional_compile:
             kwargs = dict(regional=self.args.regional_compile, dynamic=bool(self.args.packed_varlen))
-            compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, **kwargs)
+            if self.fake_transformer is not None:
+                compile_transformer(self.fake_transformer, self.fake_transformer_unwrapped, **kwargs)
             compile_transformer(self.real_transformer, self.real_transformer_unwrapped, **kwargs)
             if self.t2i_teacher is not None:
                 compile_transformer(self.t2i_teacher, self.t2i_teacher, **kwargs)
@@ -360,6 +373,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
             "rollout": [dmd_latents, do_gen_update, grad_step_idx],
             "teacher_forced": teacher_forced,
             "real_latents": patched_latents,
+            "student_input": gen_input,
             "gen_v": gen_v,
             "segments": seg_idx,
             "packed": prep["packed"],
@@ -421,12 +435,8 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
     def optimization_step(self, batch: T2IBatch, *, fetch_time_sec: float) -> dict:
         setup = self.training_step(batch, fetch_time_sec=fetch_time_sec)
         height, width, device = setup["image"]
-        eh, te_layers, patched_image_ids, joint_attn_kwargs = setup["cond"]
         dmd_latents, do_gen_update, grad_step_idx = setup["rollout"]
         teacher_forced = setup["teacher_forced"]
-        _, seg_lo, seg_hi = setup.get("tdm", [self.args.dmd_num_inference_steps, None, None])
-        gen_v = setup.get("gen_v")
-        packed_stream, text_mask = setup["packed"]
         text_encoder_time, generate_time, mask_time, fetch_time_sec = setup["timings"]
 
         named_losses = {}
@@ -436,7 +446,6 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
 
         branch = self.teacher_branch(batch, dmd_latents.shape[0], device)
         real_module = branch["teacher"]
-        fake_module = self.fake_transformer
         # 1) Student update — DMD loss (internal fake DM fwd + real teacher fwd).
         if do_gen_update:
             dmd_outputs, student_grad_norm = self._generator_update(setup, batch, branch, named_losses)
@@ -446,29 +455,10 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         if self.accelerator.sync_gradients:
             self.lr_scheduler[0].step()
 
-        # 2) Fake score forward (separate, full fake backbone on detached student latents).
-        fake_outputs = compute_fake_score_loss(
-            transformer=fake_module,
-            generated_latents=dmd_latents,
-            cond_hidden_states=eh,
-            cond_layers=te_layers,
-            img_ids=patched_image_ids,
-            attn_kwargs=joint_attn_kwargs,
-            model_dtype=self.weight_dtype,
-            seg_lo=seg_lo,
-            seg_hi=seg_hi,
-            generated_v=gen_v,
-            args=self.args,
-            packed_stream=packed_stream,
-            text_mask_after_dropout=text_mask,
-        )
-        fake_loss = fake_outputs["loss"]
-        fake_named_losses = fake_outputs.get("named_losses") or {}
-        named_losses.update(fake_named_losses)
-        self.record_loss_components({"loss": fake_loss, "named_losses": fake_named_losses})
-
-        self.accelerator.backward(fake_loss)
-        fake_grad_norm = self._step_fake_optimizer(fake_module)
+        # 2) Fake score update on the detached student latents (none without a fake critic).
+        fake_loss, fake_grad_norm = torch.tensor(0.0, device=device), None
+        if self.fake_transformer is not None:
+            fake_loss, fake_grad_norm = self._fake_update(setup, dmd_latents, named_losses)
 
         wandb_extras = self._maybe_build_image_logs(
             batch, dmd_latents, dmd_outputs, do_gen_update, height, width, setup["cond"][-1].get("context_latents")
@@ -553,6 +543,33 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self._maybe_update_ema()
         return dmd_outputs, student_grad_norm
 
+    def _fake_update(self, setup: dict, dmd_latents: torch.Tensor, named_losses):
+        """Fake critic step: flow-matching loss on the detached student x0. Returns ``(loss, grad_norm)``."""
+        eh, te_layers, patched_image_ids, joint_attn_kwargs = setup["cond"]
+        _, seg_lo, seg_hi = setup.get("tdm", [self.args.dmd_num_inference_steps, None, None])
+        packed_stream, text_mask = setup["packed"]
+        fake_outputs = compute_fake_score_loss(
+            transformer=self.fake_transformer,
+            generated_latents=dmd_latents,
+            cond_hidden_states=eh,
+            cond_layers=te_layers,
+            img_ids=patched_image_ids,
+            attn_kwargs=joint_attn_kwargs,
+            model_dtype=self.weight_dtype,
+            seg_lo=seg_lo,
+            seg_hi=seg_hi,
+            generated_v=setup.get("gen_v"),
+            args=self.args,
+            packed_stream=packed_stream,
+            text_mask_after_dropout=text_mask,
+        )
+        fake_loss = fake_outputs["loss"]
+        fake_named_losses = fake_outputs.get("named_losses") or {}
+        named_losses.update(fake_named_losses)
+        self.record_loss_components({"loss": fake_loss, "named_losses": fake_named_losses})
+        self.accelerator.backward(fake_loss)
+        return fake_loss, self._step_fake_optimizer(self.fake_transformer)
+
     def _maybe_update_ema(self):
         if not (self.accelerator.sync_gradients and self.ema_student is not None and self.global_step >= self.args.ema_start_step):
             return
@@ -582,7 +599,7 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         log_every = self.args.dmd_log_image_every
         if not (log_every > 0 and self.vae is not None and (self.global_step == 0 or (self.global_step + 1) % log_every == 0)):
             return {}
-        dmd_log_latents = dmd_outputs["log_latents"] if (do_gen_update and dmd_outputs is not None) else None
+        dmd_log_latents = dmd_outputs.get("log_latents") if (do_gen_update and dmd_outputs is not None) else None
         return self._build_image_logs(
             generated_latents=dmd_latents.detach(),
             dmd_log_latents=dmd_log_latents,
@@ -610,21 +627,18 @@ class DecoupledDMDT2ITrainer(BaseTrainer):
         self.accelerator.wait_for_everyone()
         torch.cuda.empty_cache()  # the full-state gathers stage whole tensors; free cached activations first
         logger.info(f"Saving full-FT DMD checkpoint to {save_path}")
-        student_sd = self.accelerator.get_state_dict(self.transformer, unwrap=False)
-        fake_sd = self.accelerator.get_state_dict(self.fake_transformer, unwrap=False)
-        if self.accelerator.is_main_process:
-            for sub, sd, unwrapped in (
-                ("student", student_sd, self.transformer_unwrapped),
-                ("fake", fake_sd, self.fake_transformer_unwrapped),
-            ):
+        for model, sub in self.trainable_copies():
+            sd = self.accelerator.get_state_dict(model, unwrap=False)
+            if self.accelerator.is_main_process:
                 sub_dir = os.path.join(save_path, sub)
                 os.makedirs(sub_dir, exist_ok=True)
-                unwrapped.save_config(sub_dir)
+                model.save_config(sub_dir)
                 cleaned = {k.replace("module.", "").replace("._orig_mod", ""): v.contiguous() for k, v in sd.items()}
                 save_file(cleaned, os.path.join(sub_dir, "diffusion_pytorch_model.safetensors"))
                 del cleaned
+            del sd
+        if self.accelerator.is_main_process:
             self.copy_data_input_json(save_path)
-        del student_sd, fake_sd
         if self.ema_student is not None:
             self.ema_student.save(save_path, self.accelerator, self.transformer, self.transformer_unwrapped)
         self.accelerator.wait_for_everyone()

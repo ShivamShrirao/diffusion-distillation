@@ -1,0 +1,60 @@
+# SMD on TDM segments, 4-step student, no fake critic. Starts from a DMD student (configs/dmd.yaml).
+trainer: trainers.smd.SMDTrainer
+pretrained_model_name_or_path: briaai/Fibo-2.0-dev  # the teacher, VAE and text encoder
+student_init: checkpoints/dmd/checkpoint_000400/student  # a DMD run's student
+json_data_input_path: data_input.json
+checkpoint_local_path: checkpoints/smd
+output_dir: output/smd
+wandb_project: smd
+wandb_name: smd
+seed: 42
+mixed_precision: bf16
+debug: 0
+max_train_steps: 100
+gradient_accumulation_steps: 2
+learning_rate: 0.0000025  # cosine decay to 0 at max_train_steps
+lr_scheduler: cosine
+lr_warmup_steps: 50
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-10
+adam_weight_decay: 0.01
+max_grad_norm: 4.0
+regional_compile: 1
+attn_backend: fa3
+gradient_checkpointing: 1
+gradient_checkpoint_first_n_blocks: 44
+fsdp_sharding_strategy: hybrid
+checkpointing_steps: 25
+denoising_loss_scale: 0.0
+
+dmd_num_inference_steps: "4"
+tdm_segment_renoise: 1  # one random segment per record
+dmd_real_guidance_scale: 4.0
+dmd_real_guidance_min: 3.0  # teacher CFG drawn per record in [3, 5]
+dmd_real_guidance_max: 5.0
+teacher_force_prob: 0.5
+ema_decay: 0.98
+ema_power_gamma: 0.75
+ema_start_step: 50
+t2i_teacher_path: path/to/second_teacher  # placeholder; e.g. t2i_teacher_prob 0.5 draws it on half the steps
+t2i_teacher_prob: 0.0  # off; SMD takes only this coin
+
+smd_points: 3  # stratified teacher queries per segment
+smd_pivot: alpha  # none | alpha | learned
+smd_pivot_alpha: 0.2
+smd_repulsion_lambda: 0.1
+smd_weak_guidance: 1.0
+pivot_terms: 4  # smd_pivot learned only
+pivot_blocks: 2
+pivot_dim: 1024
+pivot_feature_block_from_end: 4
+pivot_lr: 0.0001
+
+dmdr_scale: 0.0  # DMDR off; e.g. 0.02, added to the SMD loss
+dmdr_prob: 0.5
+dmdr_min_segment: 2
+dmdr_judge: Qwen/Qwen3-VL-8B-Instruct
+dmdr_both_orders: 1
+dmdr_text_scale: 0.0  # e.g. 0.02
+dmdr_text_prob: 0.7
